@@ -1,4 +1,4 @@
-# Sieve: Context-Aware Tool Output Extraction
+# Tiered Context Management
 
 ## Problem
 
@@ -160,3 +160,65 @@ runExtraction(sessionID, partID)                   — Orchestrates: load contex
 | Tier 1 vs Tier 2           | Both                            | Tier 1 is free; Tier 2 adds fidelity when worth the cost |
 | Blocking?                  | No — forked fiber, non-blocking | Conversation continues; extraction catches up            |
 | Protected tools            | `["skill"]`                     | Same as existing prune protection                        |
+
+## Architecture Overview
+
+The system has three independent components that operate at different layers:
+
+| Component   | Layer        | Purpose                                       |
+| ----------- | ------------ | --------------------------------------------- |
+| **Sieve**   | Data-tier    | Background extraction of large tool outputs   |
+| **Horizon** | Context-tier | Narrative summarization when context fills up |
+| **Seam**    | Merge        | Stitch compacted past to live present         |
+
+**Sieve** runs after every tool result that exceeds the extraction threshold. It forks a background fiber, calls a cheap model to extract relevant facts, and updates the tool output in-place.
+
+**Horizon** triggers at a configurable fraction of context capacity (default 50%). It forks a background fiber that summarizes older turns, then Seam merges the summary boundary into the session.
+
+**Seam** is invoked by Horizon when summarization completes. It inserts a compaction boundary + summary into the message stream. The existing `filterCompacted()` picks up the boundary on the next call, dropping everything before it.
+
+## Configuration
+
+All settings go under the `compaction` key in `opencode.json`:
+
+```json
+{
+  "compaction": {
+    "auto": true,
+    "prune": true,
+    "reserved": 8192,
+    "extract_threshold": 5000,
+    "truncate_lines": 2000,
+    "truncate_bytes": 51200,
+    "narrative_threshold": 0.5,
+    "preserve_turns": 4
+  }
+}
+```
+
+| Key                   | Type      | Default | Component | Description                                                                                                                                           |
+| --------------------- | --------- | ------- | --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `auto`                | `boolean` | `true`  | Horizon   | Enable automatic narrative compaction when context fills up. `false` disables Horizon entirely.                                                       |
+| `prune`               | `boolean` | `true`  | Tier 1    | Enable pruning of old tool outputs.                                                                                                                   |
+| `reserved`            | `integer` | —       | Existing  | Token buffer left for the compaction LLM call itself.                                                                                                 |
+| `extract_threshold`   | `integer` | `5000`  | Sieve     | Token estimate above which a tool output is queued for background LLM extraction. Lower values extract more aggressively.                             |
+| `truncate_lines`      | `integer` | `2000`  | Tier 0    | Max lines before truncation at execution time.                                                                                                        |
+| `truncate_bytes`      | `integer` | `51200` | Tier 0    | Max bytes (50KB) before truncation at execution time.                                                                                                 |
+| `narrative_threshold` | `float`   | `0.5`   | Horizon   | Fraction of usable context at which Horizon triggers summarization. `0.5` = 50% of context window. Lower values trigger earlier (useful for testing). |
+| `preserve_turns`      | `integer` | `4`     | Horizon   | Number of recent conversation turns to exclude from summarization. The summarizer compresses everything older than this window.                       |
+
+### Testing with a large context model
+
+With a 150k context model, Horizon's default 50% threshold means summarization won't fire until ~75k tokens — a very long conversation. To smoke-test with a short conversation:
+
+```json
+{
+  "compaction": {
+    "narrative_threshold": 0.05,
+    "preserve_turns": 2,
+    "extract_threshold": 100
+  }
+}
+```
+
+This triggers Horizon after ~7,500 tokens (5% of 150k) and Sieve on almost any tool output. For production, revert to defaults or set `narrative_threshold: 0.4`–`0.5`.
