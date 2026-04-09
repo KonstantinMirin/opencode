@@ -251,7 +251,21 @@ export namespace TieredCompaction {
 
       const enqueue = Effect.fn("TieredCompaction.enqueue")(function* (input: WatcherPayload) {
         const cfg = yield* config.get()
-        if (!ToolExtraction.shouldExtract(input.part, cfg.compaction?.extract_threshold)) return
+        const threshold = cfg.compaction?.extract_threshold ?? 5_000
+        if (!ToolExtraction.shouldExtract(input.part, threshold)) {
+          log.info("enqueue: part does not qualify for extraction", {
+            partID: input.part.id,
+            tool: input.part.tool,
+            estimate: input.estimate,
+            threshold,
+          })
+          return
+        }
+        log.info("enqueue: queuing part for extraction", {
+          partID: input.part.id,
+          tool: input.part.tool,
+          estimate: input.estimate,
+        })
         const st = yield* InstanceState.get(state)
         yield* Queue.offer(st.queue, input)
 
@@ -275,9 +289,15 @@ export namespace TieredCompaction {
         model: Provider.Model
       }) {
         const cfg = yield* config.get()
-        if (cfg.compaction?.auto === false) return false
+        if (cfg.compaction?.auto === false) {
+          log.info("exceeded: compaction auto disabled")
+          return false
+        }
         const context = input.model.limit.context
-        if (context === 0) return false
+        if (context === 0) {
+          log.info("exceeded: model context limit is 0, skipping")
+          return false
+        }
 
         const count =
           input.tokens.total ||
@@ -286,7 +306,17 @@ export namespace TieredCompaction {
         const max = ProviderTransform.maxOutputTokens(input.model)
         const usable = input.model.limit.input ? input.model.limit.input : context - max
         const threshold = cfg.compaction?.narrative_threshold ?? NARRATIVE_THRESHOLD
-        return count >= usable * threshold
+        const result = count >= usable * threshold
+        log.info("exceeded", {
+          count,
+          usable,
+          threshold,
+          result,
+          total: input.tokens.total,
+          input: input.tokens.input,
+          output: input.tokens.output,
+        })
+        return result
       })
 
       /**
@@ -303,7 +333,10 @@ export namespace TieredCompaction {
         const cfg = yield* config.get()
         const preserveTurns = cfg.compaction?.preserve_turns ?? PRESERVE_TURNS
         const msgs = MessageV2.filterCompacted(MessageV2.stream(input.sessionID))
-        if (msgs.length <= preserveTurns + 2) return // not enough history
+        if (msgs.length <= preserveTurns + 2) {
+          log.info("summarize: not enough history", { msgCount: msgs.length, needed: preserveTurns + 2 })
+          return
+        }
 
         // Find the anchor: the last user message BEFORE the preserved window
         let turns = 0
@@ -317,10 +350,16 @@ export namespace TieredCompaction {
             break
           }
         }
-        if (anchorIdx < 0) return
+        if (anchorIdx < 0) {
+          log.info("summarize: no anchor found (not enough distinct user turns)")
+          return
+        }
 
         const anchorMsg = msgs[anchorIdx]
-        if (anchorMsg.info.role !== "user") return
+        if (anchorMsg.info.role !== "user") {
+          log.info("summarize: anchor is not a user message", { role: anchorMsg.info.role })
+          return
+        }
 
         const anchor: Anchor = {
           id: anchorMsg.info.id,
@@ -332,6 +371,14 @@ export namespace TieredCompaction {
 
         // Snapshot: everything from Turn 0 through Turn X (the anchor)
         const snapshot = msgs.slice(0, anchorIdx + 1)
+
+        log.info("summarize: starting", {
+          sessionID: input.sessionID,
+          anchorID: anchor.id,
+          snapshotSize: snapshot.length,
+          totalMsgs: msgs.length,
+          preserveTurns,
+        })
 
         const agent = yield* agents.get("compaction")
         const model = agent?.model
@@ -411,12 +458,19 @@ export namespace TieredCompaction {
         model: Provider.Model
         agent: string
       }) {
-        // Don't start a new compaction if one is already in-flight
         const st = yield* InstanceState.get(state)
         const ps = getPerSession(st, input.sessionID)
-        if (ps.anchor) return false
+        if (ps.anchor) {
+          log.info("check: compaction already in-flight", { sessionID: input.sessionID })
+          return false
+        }
 
-        if (!(yield* exceeded({ tokens: input.tokens, model: input.model }))) return false
+        if (!(yield* exceeded({ tokens: input.tokens, model: input.model }))) {
+          log.info("check: threshold not exceeded", { sessionID: input.sessionID })
+          return false
+        }
+
+        log.info("check: threshold exceeded, starting summarization", { sessionID: input.sessionID })
 
         const count =
           input.tokens.total ||
