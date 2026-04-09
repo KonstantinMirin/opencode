@@ -191,7 +191,7 @@ All settings go under the `compaction` key in `opencode.json`:
     "truncate_lines": 2000,
     "truncate_bytes": 51200,
     "narrative_threshold": 0.5,
-    "preserve_turns": 4
+    "preserve_turns": 5
   }
 }
 ```
@@ -205,7 +205,7 @@ All settings go under the `compaction` key in `opencode.json`:
 | `truncate_lines`      | `integer` | `2000`  | Tier 0    | Max lines before truncation at execution time.                                                                                                        |
 | `truncate_bytes`      | `integer` | `51200` | Tier 0    | Max bytes (50KB) before truncation at execution time.                                                                                                 |
 | `narrative_threshold` | `float`   | `0.5`   | Horizon   | Fraction of usable context at which Horizon triggers summarization. `0.5` = 50% of context window. Lower values trigger earlier (useful for testing). |
-| `preserve_turns`      | `integer` | `4`     | Horizon   | Number of recent conversation turns to exclude from summarization. The summarizer compresses everything older than this window.                       |
+| `preserve_turns`      | `integer` | `5`     | Horizon   | Number of recent conversation turns to exclude from summarization. The summarizer compresses everything older than this window.                       |
 
 ### Testing with a large context model
 

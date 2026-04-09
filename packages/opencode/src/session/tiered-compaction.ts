@@ -129,7 +129,7 @@ export namespace TieredCompaction {
   const NARRATIVE_THRESHOLD = 0.5
 
   /** Horizon: preserve the N most recent turns from compaction */
-  const PRESERVE_TURNS = 4
+  const PRESERVE_TURNS = 5
 
   // ───────────────────────────────────────────────────────────────
   // Service Interface
