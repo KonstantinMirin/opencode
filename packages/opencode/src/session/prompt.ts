@@ -1419,6 +1419,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             }
 
             if (lastFinished && lastFinished.summary !== true) {
+              const cfg = yield* configService.get()
               const recentMsgs = yield* sessions.messages({ sessionID }).pipe(Effect.catch(() => Effect.succeed([])))
               for (const msg of recentMsgs) {
                 for (const part of msg.parts) {
@@ -1426,7 +1427,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                     part.type === "tool" &&
                     part.state.status === "completed" &&
                     !part.state.time.compacted &&
-                    ToolExtraction.shouldExtract(part)
+                    ToolExtraction.shouldExtract(part, cfg.compaction?.extract_threshold)
                   ) {
                     yield* tiered
                       .enqueue({
