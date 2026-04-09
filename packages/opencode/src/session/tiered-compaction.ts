@@ -333,25 +333,37 @@ export namespace TieredCompaction {
         const cfg = yield* config.get()
         const preserveTurns = cfg.compaction?.preserve_turns ?? PRESERVE_TURNS
         const msgs = MessageV2.filterCompacted(MessageV2.stream(input.sessionID))
-        if (msgs.length <= preserveTurns + 2) {
-          log.info("summarize: not enough history", { msgCount: msgs.length, needed: preserveTurns + 2 })
+        // Count user turns to decide if there's enough history to summarize
+        const userTurns = msgs.filter(
+          (m) => m.info.role === "user" && !m.parts.some((p) => p.type === "compaction"),
+        ).length
+        if (userTurns < 1) {
+          log.info("summarize: no user turns to summarize", { msgCount: msgs.length })
           return
         }
 
-        // Find the anchor: the last user message BEFORE the preserved window
+        // Find the anchor: the user message that marks the boundary between
+        // what gets summarized and what gets preserved. With N user turns, we
+        // preserve the last preserveTurns and anchor on the one before that.
+        // If userTurns <= preserveTurns, anchor on the first user message,
+        // summarizing everything up to (but excluding) the last turn.
         let turns = 0
         let anchorIdx = -1
         for (let i = msgs.length - 1; i >= 0; i--) {
           if (msgs[i].info.role === "user" && !msgs[i].parts.some((p) => p.type === "compaction")) {
             turns++
           }
-          if (turns > preserveTurns) {
+          if (userTurns > preserveTurns && turns > preserveTurns) {
             anchorIdx = i
             break
           }
         }
+        // If all user turns fit within the preserved window, anchor on the first user turn
         if (anchorIdx < 0) {
-          log.info("summarize: no anchor found (not enough distinct user turns)")
+          anchorIdx = msgs.findIndex((m) => m.info.role === "user" && !m.parts.some((p) => p.type === "compaction"))
+        }
+        if (anchorIdx < 0) {
+          log.info("summarize: no anchor found")
           return
         }
 
