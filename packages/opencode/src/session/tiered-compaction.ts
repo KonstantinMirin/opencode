@@ -267,7 +267,7 @@ export namespace TieredCompaction {
       // ─────────────────────────────────────────────────────────
 
       /**
-       * Check whether current token usage has crossed the 50% threshold
+       * Check whether current token usage has crossed the narrative threshold
        * of the model's usable context window.
        */
       const exceeded = Effect.fn("TieredCompaction.exceeded")(function* (input: {
@@ -285,12 +285,13 @@ export namespace TieredCompaction {
 
         const max = ProviderTransform.maxOutputTokens(input.model)
         const usable = input.model.limit.input ? input.model.limit.input : context - max
-        return count >= usable * NARRATIVE_THRESHOLD
+        const threshold = cfg.compaction?.narrative_threshold ?? NARRATIVE_THRESHOLD
+        return count >= usable * threshold
       })
 
       /**
        * Fork background narrative summarization. Selects messages up to
-       * (but excluding the most recent PRESERVE_TURNS turns), creates the
+       * (but excluding the most recent preserveTurns turns), creates the
        * anchor, and runs the summarizer in a detached fiber.
        */
       const summarize = Effect.fn("TieredCompaction.summarize")(function* (input: {
@@ -299,8 +300,10 @@ export namespace TieredCompaction {
         model: { providerID: ProviderID; modelID: ModelID }
         tokens: number
       }) {
+        const cfg = yield* config.get()
+        const preserveTurns = cfg.compaction?.preserve_turns ?? PRESERVE_TURNS
         const msgs = MessageV2.filterCompacted(MessageV2.stream(input.sessionID))
-        if (msgs.length <= PRESERVE_TURNS + 2) return // not enough history
+        if (msgs.length <= preserveTurns + 2) return // not enough history
 
         // Find the anchor: the last user message BEFORE the preserved window
         let turns = 0
@@ -309,7 +312,7 @@ export namespace TieredCompaction {
           if (msgs[i].info.role === "user" && !msgs[i].parts.some((p) => p.type === "compaction")) {
             turns++
           }
-          if (turns > PRESERVE_TURNS) {
+          if (turns > preserveTurns) {
             anchorIdx = i
             break
           }

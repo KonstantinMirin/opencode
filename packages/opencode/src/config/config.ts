@@ -1050,6 +1050,20 @@ export namespace Config {
             .min(0)
             .optional()
             .describe("Maximum bytes for tool output before truncation. Default: 51200 (50KB)."),
+          narrative_threshold: z
+            .number()
+            .min(0)
+            .max(1)
+            .optional()
+            .describe(
+              "Fraction of usable context at which Horizon triggers narrative summarization. Default: 0.5 (50%).",
+            ),
+          preserve_turns: z
+            .number()
+            .int()
+            .min(0)
+            .optional()
+            .describe("Number of recent turns Horizon preserves from summarization. Default: 4."),
         })
         .optional(),
       experimental: z
