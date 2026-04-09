@@ -8,6 +8,7 @@ import { Snapshot } from "@/snapshot"
 import { SyncEvent } from "../sync"
 import { Database, NotFoundError, and, desc, eq, inArray, lt, or } from "@/storage/db"
 import { MessageTable, PartTable, SessionTable } from "./session.sql"
+import { ToolExtraction } from "./tool-extraction"
 import { ProviderError } from "@/provider/error"
 import { iife } from "@/util/iife"
 import { errorMessage } from "@/util/error"
@@ -15,7 +16,6 @@ import type { SystemError } from "bun"
 import type { Provider } from "@/provider/provider"
 import { ModelID, ProviderID } from "@/provider/schema"
 import { Effect } from "effect"
-
 /** Error shape thrown by Bun's fetch() when gzip/br decompression fails mid-stream */
 interface FetchDecompressionError extends Error {
   code: "ZlibError"
@@ -208,6 +208,7 @@ export namespace MessageV2 {
     type: z.literal("compaction"),
     auto: z.boolean(),
     overflow: z.boolean().optional(),
+    anchor: MessageID.zod.optional(),
   }).meta({
     ref: "CompactionPart",
   })
@@ -715,8 +716,14 @@ export namespace MessageV2 {
           if (part.type === "tool") {
             toolNames.add(part.tool)
             if (part.state.status === "completed") {
-              const outputText = part.state.time.compacted ? "[Old tool result content cleared]" : part.state.output
-              const attachments = part.state.time.compacted || options?.stripMedia ? [] : (part.state.attachments ?? [])
+              const isCompacted = part.state.time.compacted !== undefined
+              const hasExtraction = isCompacted && (part.state.metadata as Record<string, any>)?.extraction
+              const outputText = hasExtraction
+                ? part.state.output
+                : isCompacted
+                  ? ToolExtraction.structuredPreviewSync(part)
+                  : part.state.output
+              const attachments = isCompacted || options?.stripMedia ? [] : (part.state.attachments ?? [])
 
               // For providers that don't support media in tool results, extract media files
               // (images, PDFs) to be sent as a separate user message
@@ -901,19 +908,43 @@ export namespace MessageV2 {
   }
 
   export function filterCompacted(msgs: Iterable<MessageV2.WithParts>) {
-    const result = [] as MessageV2.WithParts[]
+    const all = [...msgs]
     const completed = new Set<string>()
-    for (const msg of msgs) {
-      result.push(msg)
+    let boundaryIdx = -1
+    let anchorID: string | undefined
+    for (let i = 0; i < all.length; i++) {
+      const msg = all[i]
+      if (msg.info.role === "assistant" && msg.info.summary && msg.info.finish && !msg.info.error)
+        completed.add(msg.info.parentID)
       if (
         msg.info.role === "user" &&
         completed.has(msg.info.id) &&
         msg.parts.some((part) => part.type === "compaction")
-      )
-        break
-      if (msg.info.role === "assistant" && msg.info.summary && msg.info.finish && !msg.info.error)
-        completed.add(msg.info.parentID)
+      ) {
+        if (boundaryIdx === -1) {
+          boundaryIdx = i
+          const part = msg.parts.find((p) => p.type === "compaction")
+          if (part && part.type === "compaction") anchorID = part.anchor
+        }
+      }
     }
+    if (boundaryIdx === -1) {
+      all.reverse()
+      return all
+    }
+    if (anchorID) {
+      const boundary = all[boundaryIdx]
+      return all
+        .filter((m) => {
+          if (m.info.id === boundary.info.id) return true
+          if (m.info.role === "assistant" && m.info.parentID === boundary.info.id) return true
+          if (m.info.id <= anchorID) return false
+          if (m.info.role === "assistant" && m.info.parentID === anchorID) return false
+          return true
+        })
+        .reverse()
+    }
+    const result = all.slice(0, boundaryIdx + 1)
     result.reverse()
     return result
   }

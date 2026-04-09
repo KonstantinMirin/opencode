@@ -11,6 +11,9 @@ import { Provider } from "../provider/provider"
 import { ModelID, ProviderID } from "../provider/schema"
 import { type Tool as AITool, tool, jsonSchema, type ToolExecutionOptions, asSchema } from "ai"
 import { SessionCompaction } from "./compaction"
+import { TieredCompaction } from "./tiered-compaction"
+import { ToolExtraction } from "./tool-extraction"
+import { Token } from "../util/token"
 import { Instance } from "../project/instance"
 import { Bus } from "../bus"
 import { ProviderTransform } from "../provider/transform"
@@ -34,6 +37,7 @@ import * as Stream from "effect/Stream"
 import { Command } from "../command"
 import { pathToFileURL, fileURLToPath } from "url"
 import { ConfigMarkdown } from "../config/markdown"
+import { Config } from "../config/config"
 import { SessionSummary } from "./summary"
 import { NamedError } from "@opencode-ai/util/error"
 import { SessionProcessor } from "./processor"
@@ -89,10 +93,12 @@ export namespace SessionPrompt {
       const provider = yield* Provider.Service
       const processor = yield* SessionProcessor.Service
       const compaction = yield* SessionCompaction.Service
+      const tiered = yield* TieredCompaction.Service
       const plugin = yield* Plugin.Service
       const commands = yield* Command.Service
       const permission = yield* Permission.Service
       const fsys = yield* AppFileSystem.Service
+      const configService = yield* Config.Service
       const mcp = yield* MCP.Service
       const lsp = yield* LSP.Service
       const filetime = yield* FileTime.Service
@@ -523,7 +529,15 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   }
                 }
 
-                const truncated = yield* truncate.output(textParts.join("\n\n"), {}, input.agent)
+                const cfg = yield* configService.get()
+                const truncated = yield* truncate.output(
+                  textParts.join("\n\n"),
+                  {
+                    maxLines: cfg.compaction?.truncate_lines,
+                    maxBytes: cfg.compaction?.truncate_bytes,
+                  },
+                  input.agent,
+                )
                 const metadata = {
                   ...(result.metadata ?? {}),
                   truncated: truncated.truncated,
@@ -1418,6 +1432,48 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               continue
             }
 
+            if (lastFinished && lastFinished.summary !== true) {
+              yield* tiered
+                .check({
+                  sessionID,
+                  tokens: lastFinished.tokens,
+                  model,
+                  agent: lastUser.agent,
+                })
+                .pipe(
+                  Effect.catch(() => Effect.void),
+                  Effect.ignore,
+                  Effect.forkIn(scope),
+                )
+            }
+
+            if (lastFinished && lastFinished.summary !== true) {
+              const cfg = yield* configService.get()
+              const recentMsgs = yield* sessions.messages({ sessionID }).pipe(Effect.catch(() => Effect.succeed([])))
+              for (const msg of recentMsgs) {
+                for (const part of msg.parts) {
+                  if (
+                    part.type === "tool" &&
+                    part.state.status === "completed" &&
+                    !part.state.time.compacted &&
+                    ToolExtraction.shouldExtract(part, cfg.compaction?.extract_threshold)
+                  ) {
+                    yield* tiered
+                      .enqueue({
+                        sessionID,
+                        part,
+                        estimate: Token.estimate(part.state.output),
+                      })
+                      .pipe(
+                        Effect.catch(() => Effect.void),
+                        Effect.ignore,
+                        Effect.forkIn(scope),
+                      )
+                  }
+                }
+              }
+            }
+
             const agent = yield* agents.get(lastUser.agent)
             if (!agent) {
               const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
@@ -1714,6 +1770,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       layer.pipe(
         Layer.provide(SessionStatus.layer),
         Layer.provide(SessionCompaction.defaultLayer),
+        Layer.provide(TieredCompaction.defaultLayer),
         Layer.provide(SessionProcessor.defaultLayer),
         Layer.provide(Command.defaultLayer),
         Layer.provide(Permission.defaultLayer),
@@ -1729,6 +1786,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         Layer.provide(Session.defaultLayer),
         Layer.provide(Agent.defaultLayer),
         Layer.provide(Bus.layer),
+        Layer.provide(Config.defaultLayer),
         Layer.provide(CrossSpawnSpawner.defaultLayer),
       ),
     ),

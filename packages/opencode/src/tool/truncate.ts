@@ -14,8 +14,12 @@ export namespace Truncate {
   const log = Log.create({ service: "truncation" })
   const RETENTION = Duration.days(7)
 
-  export const MAX_LINES = 2000
-  export const MAX_BYTES = 50 * 1024
+  export const DEFAULT_MAX_LINES = 2000
+  export const DEFAULT_MAX_BYTES = 50 * 1024
+  /** @deprecated Use DEFAULT_MAX_LINES */
+  export const MAX_LINES = DEFAULT_MAX_LINES
+  /** @deprecated Use DEFAULT_MAX_BYTES */
+  export const MAX_BYTES = DEFAULT_MAX_BYTES
   export const DIR = TRUNCATION_DIR
   export const GLOB = path.join(TRUNCATION_DIR, "*")
 
@@ -61,8 +65,8 @@ export namespace Truncate {
       })
 
       const output = Effect.fn("Truncate.output")(function* (text: string, options: Options = {}, agent?: Agent.Info) {
-        const maxLines = options.maxLines ?? MAX_LINES
-        const maxBytes = options.maxBytes ?? MAX_BYTES
+        const maxLines = options.maxLines ?? DEFAULT_MAX_LINES
+        const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES
         const direction = options.direction ?? "head"
         const lines = text.split("\n")
         const totalBytes = Buffer.byteLength(text, "utf-8")
