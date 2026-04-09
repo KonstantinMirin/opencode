@@ -372,13 +372,41 @@ export namespace TieredCompaction {
         }
         if (anchorIdx < 0) {
           log.info("summarize: no anchor found")
-          const st = yield* InstanceState.get(state)
-          const ps = getPerSession(st, input.sessionID)
-          if (ps) {
-            ps.anchor = undefined
-            ps.fiber = undefined
+          const st2 = yield* InstanceState.get(state)
+          const ps2 = getPerSession(st2, input.sessionID)
+          if (ps2) {
+            ps2.anchor = undefined
+            ps2.fiber = undefined
           }
           return
+        }
+
+        // Don't re-compact if the live buffer (after existing boundary) has
+        // fewer user turns than preserveTurns — there's nothing meaningful
+        // to compact. Clear the in-flight anchor so check() can retry later
+        // when more turns accumulate.
+        const existingBoundary = msgs.find(
+          (m) => m.info.role === "user" && m.parts.some((p) => p.type === "compaction"),
+        )
+        if (existingBoundary) {
+          const boundaryIdx = msgs.indexOf(existingBoundary)
+          const afterBoundary = msgs.slice(boundaryIdx + 2)
+          const liveUserTurns = afterBoundary.filter(
+            (m) => m.info.role === "user" && !m.parts.some((p) => p.type === "compaction"),
+          )
+          if (liveUserTurns.length <= preserveTurns) {
+            log.info("summarize: live buffer too small to compact further", {
+              liveUserTurns: liveUserTurns.length,
+              preserveTurns,
+            })
+            const st2 = yield* InstanceState.get(state)
+            const ps2 = getPerSession(st2, input.sessionID)
+            if (ps2) {
+              ps2.anchor = undefined
+              ps2.fiber = undefined
+            }
+            return
+          }
         }
 
         const anchorMsg = msgs[anchorIdx]
