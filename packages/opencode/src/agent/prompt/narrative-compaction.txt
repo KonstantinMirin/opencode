@@ -1,42 +1,21 @@
-You are performing a context management operation. You are NOT changing roles or starting a new conversation. You are the same agent, preserving your own memory so you can continue working without interruption.
+You are compressing conversation history into a compact continuation state. The agent that reads this IS you — write it as notes to yourself so you can continue working.
 
-Your task: compress the conversation history into a structured continuation state. The agent that reads this summary IS you — write it as notes to yourself.
+Rules:
+- You MUST preserve exact file paths, function names, variable names, error messages, and code snippets that were discussed. Paraphrasing these destroys information.
+- Do NOT adopt a new persona. Do NOT include pleasantries or meta-commentary.
+- Do NOT call any tools. Respond only with the summary.
+- Use the same language the user used.
 
-CRITICAL CONSTRAINTS:
-- Do NOT adopt a new persona or reset your behavior.
-- Do NOT summarize the user's request as if you are an outside observer. Write from first person perspective as the working agent.
-- Do NOT call any tools. Respond only with the structured summary below.
-- Do NOT include pleasantries, preambles, or meta-commentary.
-- Respond in the same language the user used in the conversation.
-
-Produce the following structure exactly:
-
----
-## Identity
-
-[Restate your active role, any custom instructions the user gave you, and behavioral constraints you are operating under. This ensures continuity of persona across the compression boundary.]
+Structure your response as:
 
 ## Goal
+What the user asked for, and any scope changes during the conversation.
 
-[What is the user trying to accomplish? Include the original request verbatim if short, or a precise paraphrase if long. Note any refinements or scope changes that occurred during the conversation.]
+## What was done
+Specific actions taken: files read, edited, created. Include exact paths. Note what worked and what didn't. Include relevant error messages verbatim.
 
-## Plan
+## Key findings
+Technical facts, patterns, constraints, or decisions discovered. Include exact function signatures, schema shapes, config values, or API behaviors. Prefer specific references over vague descriptions.
 
-[What is the current execution plan? List ordered steps. Mark each as DONE, IN-PROGRESS, or TODO. If a plan file exists, reference its path.]
-
-## Discoveries
-
-[Key technical facts, constraints, patterns, or decisions discovered during work. Include file paths, function signatures, schema shapes, or API behaviors that would be expensive to re-derive. Be specific — "the auth middleware is in src/middleware/auth.ts:42" not "we found the auth code".]
-
-## State
-
-[Current working state. What was the last action taken? What is the immediate next action? Include any partial results, error messages, or blockers. If files were modified, list them with a one-line description of the change.]
-
-## Files
-
-[Structured list of all relevant files, grouped by status:]
-- Modified: [files you edited, with one-line change description]
-- Read: [files you examined for context]
-- Created: [new files you created]
-- Pending: [files you still need to examine or modify]
----
+## What's next
+The immediate next action needed to continue working toward the goal.

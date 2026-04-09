@@ -389,8 +389,29 @@ export namespace TieredCompaction {
           model: input.model,
         }
 
-        // Snapshot: everything from Turn 0 through Turn X (the anchor)
-        const snapshot = msgs.slice(0, anchorIdx + 1)
+        // Snapshot: everything from the start through the anchor user message,
+        // including all assistant responses that follow the anchor.
+        // When userTurns <= preserveTurns, we summarize everything up to
+        // (but excluding) the last user turn + its assistant response.
+        let snapshotEnd = msgs.length
+        if (userTurns <= preserveTurns) {
+          // Preserve the last user turn and its response: find the last
+          // user turn and include everything before it in the snapshot.
+          let lastUserIdx = -1
+          for (let i = msgs.length - 1; i >= 0; i--) {
+            if (msgs[i].info.role === "user" && !msgs[i].parts.some((p) => p.type === "compaction")) {
+              lastUserIdx = i
+              break
+            }
+          }
+          if (lastUserIdx > 0) {
+            // Include all messages before the last user turn in the snapshot.
+            // Also include any assistant responses to the anchor that are
+            // before the last user turn.
+            snapshotEnd = lastUserIdx
+          }
+        }
+        const snapshot = msgs.slice(0, Math.max(anchorIdx + 1, snapshotEnd))
 
         log.info("summarize: starting", {
           sessionID: input.sessionID,
