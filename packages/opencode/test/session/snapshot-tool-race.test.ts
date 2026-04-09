@@ -41,6 +41,7 @@ import { Provider as ProviderSvc } from "../../src/provider/provider"
 import { Question } from "../../src/question"
 import { Todo } from "../../src/session/todo"
 import { SessionCompaction } from "../../src/session/compaction"
+import { TieredCompaction } from "../../src/session/tiered-compaction"
 import { Instruction } from "../../src/session/instruction"
 import { SessionProcessor } from "../../src/session/processor"
 import { SessionStatus } from "../../src/session/status"
@@ -136,10 +137,12 @@ function makeHttp() {
   const trunc = Truncate.layer.pipe(Layer.provideMerge(deps))
   const proc = SessionProcessor.layer.pipe(Layer.provideMerge(deps))
   const compact = SessionCompaction.layer.pipe(Layer.provideMerge(proc), Layer.provideMerge(deps))
+  const tiered = TieredCompaction.layer.pipe(Layer.provideMerge(deps))
   return Layer.mergeAll(
     TestLLMServer.layer,
     SessionPrompt.layer.pipe(
       Layer.provideMerge(compact),
+      Layer.provideMerge(tiered),
       Layer.provideMerge(proc),
       Layer.provideMerge(registry),
       Layer.provideMerge(trunc),

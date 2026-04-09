@@ -1053,7 +1053,13 @@ export function Session() {
               scrollAcceleration={scrollAcceleration()}
             >
               <box height={1} />
-              <For each={messages()}>
+              <For
+                each={messages().filter((m) => {
+                  const parts = sync.data.part[m.id] ?? []
+                  if (m.role === "user" && parts.some((p) => p.type === "compaction")) return false
+                  return true
+                })}
+              >
                 {(message, index) => (
                   <Switch>
                     <Match when={message.id === revert()?.messageID}>
@@ -1303,7 +1309,7 @@ function UserMessage(props: {
           </box>
         </box>
       </Show>
-      <Show when={compaction()}>
+      <Show when={false && compaction()}>
         <box
           marginTop={1}
           border={["top"]}
