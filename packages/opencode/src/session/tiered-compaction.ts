@@ -375,6 +375,38 @@ export namespace TieredCompaction {
           return
         }
 
+        // Don't re-compact if the only user turns are inside an existing
+        // compaction boundary (the live buffer is too small to meaningfully compact)
+        const existingBoundary = msgs.find(
+          (m) => m.info.role === "user" && m.parts.some((p) => p.type === "compaction"),
+        )
+        if (existingBoundary) {
+          // Find the latest non-boundary user turn in the live buffer
+          // (messages after the boundary + summary)
+          const boundaryIdx = msgs.indexOf(existingBoundary)
+          const afterBoundary = msgs.slice(boundaryIdx + 2) // skip boundary + summary
+          const liveUserTurns = afterBoundary.filter(
+            (m) => m.info.role === "user" && !m.parts.some((p) => p.type === "compaction"),
+          )
+          if (liveUserTurns.length <= preserveTurns) {
+            log.info("summarize: live buffer too small to compact further", {
+              liveUserTurns: liveUserTurns.length,
+              preserveTurns,
+            })
+            const st = yield* InstanceState.get(state)
+            const ps = getPerSession(st, input.sessionID)
+            if (ps) {
+              ps.anchor = undefined
+              ps.fiber = undefined
+            }
+            return
+          }
+        }
+        if (anchorIdx < 0) {
+          log.info("summarize: no anchor found")
+          return
+        }
+
         const anchorMsg = msgs[anchorIdx]
         if (anchorMsg.info.role !== "user") {
           log.info("summarize: anchor is not a user message", { role: anchorMsg.info.role })
@@ -597,6 +629,13 @@ export namespace TieredCompaction {
         )
         if (alreadyMerged) {
           log.info("merge already completed for this anchor", { anchor: input.anchor })
+          // Clear the in-flight anchor so check() can trigger a new compaction
+          const st = yield* InstanceState.get(state)
+          const ps = st.sessions.get(input.sessionID)
+          if (ps) {
+            ps.anchor = undefined
+            ps.fiber = undefined
+          }
           return
         }
 
