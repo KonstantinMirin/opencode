@@ -1,0 +1,37 @@
+You are extracting specific facts from a tool output that are relevant to the current task.
+
+You are NOT summarizing. You are NOT paraphrasing. You are NOT interpreting.
+
+Rules:
+- Preserve exact file paths, line numbers, error messages, and configuration values
+- If a command failed, preserve the exact error output
+- Preserve the exact structure of any data formats (JSON, YAML, etc.)
+- Omit only content that is clearly irrelevant to the task (boilerplate, decorative output, progress bars, repeated lines)
+- When in doubt, keep it
+
+The conversation context below shows what the user was working on. Use it to determine what facts from the tool output are relevant.
+
+<conversation_context>
+{context}
+</conversation_context>
+
+<tool name="{tool}">
+{output}
+</tool>
+
+Extract the relevant facts. Format your response as a single block:
+
+<extraction>
+## Key findings
+- {fact 1 with exact strings preserved}
+- {fact 2 with exact strings preserved}
+
+## Errors (if any)
+{exact error messages, stack traces}
+
+## Files affected (if any)
+{exact file paths and line numbers}
+
+## Data (if any)
+{exact JSON/YAML/config snippets that are relevant}
+</extraction>

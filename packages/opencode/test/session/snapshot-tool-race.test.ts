@@ -44,6 +44,7 @@ import { Skill } from "../../src/skill"
 import { SystemPrompt } from "../../src/session/system"
 import { Todo } from "../../src/session/todo"
 import { SessionCompaction } from "../../src/session/compaction"
+import { TieredCompaction } from "../../src/session/tiered-compaction"
 import { Instruction } from "../../src/session/instruction"
 import { SessionProcessor } from "../../src/session/processor"
 import { SessionRunState } from "../../src/session/run-state"
@@ -148,6 +149,7 @@ function makeHttp() {
   const trunc = Truncate.layer.pipe(Layer.provideMerge(deps))
   const proc = SessionProcessor.layer.pipe(Layer.provide(SessionSummary.defaultLayer), Layer.provideMerge(deps))
   const compact = SessionCompaction.layer.pipe(Layer.provideMerge(proc), Layer.provideMerge(deps))
+  const tiered = TieredCompaction.layer.pipe(Layer.provideMerge(deps))
   return Layer.mergeAll(
     TestLLMServer.layer,
     SessionSummary.defaultLayer,
@@ -156,6 +158,7 @@ function makeHttp() {
       Layer.provide(SessionSummary.defaultLayer),
       Layer.provideMerge(run),
       Layer.provideMerge(compact),
+      Layer.provideMerge(tiered),
       Layer.provideMerge(proc),
       Layer.provideMerge(registry),
       Layer.provideMerge(trunc),

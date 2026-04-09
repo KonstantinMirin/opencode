@@ -1030,6 +1030,26 @@ export namespace Config {
             .min(0)
             .optional()
             .describe("Token buffer for compaction. Leaves enough window to avoid overflow during compaction."),
+          extract_threshold: z
+            .number()
+            .int()
+            .min(0)
+            .optional()
+            .describe(
+              "Token estimate threshold for background tool output extraction. Tool outputs above this will be extracted by a cheaper model. Default: 5000.",
+            ),
+          truncate_lines: z
+            .number()
+            .int()
+            .min(0)
+            .optional()
+            .describe("Maximum lines for tool output before truncation. Default: 2000."),
+          truncate_bytes: z
+            .number()
+            .int()
+            .min(0)
+            .optional()
+            .describe("Maximum bytes for tool output before truncation. Default: 51200 (50KB)."),
         })
         .optional(),
       experimental: z
