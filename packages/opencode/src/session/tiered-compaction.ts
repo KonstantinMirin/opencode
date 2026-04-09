@@ -89,6 +89,8 @@ export namespace TieredCompaction {
     readonly queue: Queue.Queue<WatcherPayload>
     /** Sieve: background fiber running the extraction loop */
     watcher: Fiber.Fiber<void> | undefined
+    /** Sieve: part IDs already enqueued (prevents re-queueing on every turn) */
+    readonly enqueued: Set<string>
   }
 
   /** Payload enqueued for Sieve background extraction */
@@ -204,6 +206,7 @@ export namespace TieredCompaction {
             sessions: new Map(),
             queue: q,
             watcher: undefined,
+            enqueued: new Set(),
           }
           yield* Effect.addFinalizer(
             Effect.fnUntraced(function* () {
@@ -236,8 +239,11 @@ export namespace TieredCompaction {
        * Delegates to ToolExtraction for the actual LLM call.
        */
       const processExtraction = Effect.fn("TieredCompaction.processExtraction")(function* (payload: WatcherPayload) {
+        log.info("processExtraction: starting", { partID: payload.part.id, tool: payload.part.tool })
         const extraction = yield* ToolExtraction.Service
         yield* extraction.extract({ sessionID: payload.sessionID, part: payload.part })
+        const st = yield* InstanceState.get(state)
+        st.enqueued.delete(payload.part.id)
       })
 
       /** Background loop: dequeue and extract tool outputs one at a time */
@@ -261,12 +267,14 @@ export namespace TieredCompaction {
           })
           return
         }
+        const st = yield* InstanceState.get(state)
+        if (st.enqueued.has(input.part.id)) return
+        st.enqueued.add(input.part.id)
         log.info("enqueue: queuing part for extraction", {
           partID: input.part.id,
           tool: input.part.tool,
           estimate: input.estimate,
         })
-        const st = yield* InstanceState.get(state)
         yield* Queue.offer(st.queue, input)
 
         // Lazily start the background watcher fiber
