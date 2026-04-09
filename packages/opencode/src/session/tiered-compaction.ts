@@ -394,7 +394,7 @@ export namespace TieredCompaction {
           const liveUserTurns = afterBoundary.filter(
             (m) => m.info.role === "user" && !m.parts.some((p) => p.type === "compaction"),
           )
-          if (liveUserTurns.length <= preserveTurns) {
+          if (liveUserTurns.length < preserveTurns) {
             log.info("summarize: live buffer too small to compact further", {
               liveUserTurns: liveUserTurns.length,
               preserveTurns,
