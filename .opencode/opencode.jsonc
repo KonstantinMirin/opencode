@@ -16,8 +16,8 @@
     "github-pr-search": false,
   },
   "compaction": {
-    "narrative_threshold": 0.25,
-    "preserve_turns": 10,
-    "extract_threshold": 500,
+    "narrative_threshold": 0.5,
+    "preserve_turns": 5,
+    "extract_threshold": 5000,
   },
 }

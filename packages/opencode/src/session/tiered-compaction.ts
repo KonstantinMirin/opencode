@@ -41,6 +41,7 @@ import z from "zod"
 
 import PROMPT_NARRATIVE from "@/agent/prompt/narrative-compaction.txt"
 import { ToolExtraction } from "./tool-extraction"
+import { Identifier } from "@/id/id"
 
 export namespace TieredCompaction {
   const log = Log.create({ service: "session.tiered-compaction" })
@@ -645,20 +646,30 @@ export namespace TieredCompaction {
         // Synthetic user message with a CompactionPart marking the
         // anchor point. filterCompacted finds the latest completed
         // compaction boundary and returns everything from that point
-        // to the newest message, so the boundary can appear at any
-        // position in the stream — even after live-buffer messages
-        // that were added during the summarization window.
+        // to the newest message.
+        //
+        // Use IDs/timestamps just after the anchor so they sort into
+        // position in the stream — the boundary appears right after
+        // the anchor's assistant response, not at the end.
+        const anchorTimestamp = Identifier.timestamp(input.anchor)
+        // Use timestamps slightly after the anchor so boundary/summary sort
+        // into position right after the anchor message in the stream.
+        // +1ms for boundary, +2ms for summary — avoids collision with
+        // existing IDs thanks to the random suffix in Identifier.create.
+        const boundaryTime = anchorTimestamp + 1
+        const summaryTime = anchorTimestamp + 2
+
         const boundary = yield* session.updateMessage({
-          id: MessageID.ascending(),
+          id: MessageID.make(Identifier.create("message", false, boundaryTime)),
           role: "user",
           sessionID: input.sessionID,
-          time: { created: Date.now() },
+          time: { created: boundaryTime },
           agent: input.agent,
           model: input.model,
         })
 
         yield* session.updatePart({
-          id: PartID.ascending(),
+          id: PartID.make(Identifier.create("part", false, boundaryTime)),
           messageID: boundary.id,
           sessionID: input.sessionID,
           type: "compaction",
@@ -671,7 +682,7 @@ export namespace TieredCompaction {
         // summary=true + finish="stop" → filterCompacted() treats this
         // as a completed boundary marker.
         const summaryMsg: MessageV2.Assistant = {
-          id: MessageID.ascending(),
+          id: MessageID.make(Identifier.create("message", false, summaryTime)),
           role: "assistant",
           parentID: boundary.id,
           sessionID: input.sessionID,
@@ -684,23 +695,23 @@ export namespace TieredCompaction {
           tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
           modelID: input.model.modelID,
           providerID: input.model.providerID,
-          time: { created: Date.now(), completed: Date.now() },
+          time: { created: summaryTime, completed: summaryTime },
         }
         yield* session.updateMessage(summaryMsg)
 
         // ── Step 5: Write the summary text as a text part ──
         yield* session.updatePart({
-          id: PartID.ascending(),
+          id: PartID.make(Identifier.create("part", false, summaryTime)),
           messageID: summaryMsg.id,
           sessionID: input.sessionID,
           type: "text",
           text: input.summary,
-          time: { start: Date.now(), end: Date.now() },
+          time: { start: summaryTime, end: summaryTime },
         })
 
         // ── Step 6: Write a step-finish so the message is well-formed ──
         yield* session.updatePart({
-          id: PartID.ascending(),
+          id: PartID.make(Identifier.create("part", false, summaryTime + 1)),
           messageID: summaryMsg.id,
           sessionID: input.sessionID,
           type: "step-finish",
