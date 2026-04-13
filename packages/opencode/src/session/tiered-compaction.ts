@@ -35,7 +35,7 @@ import { ModelID, ProviderID } from "@/provider/schema"
 import { ProviderTransform } from "@/provider/transform"
 import { LLM } from "./llm"
 import { InstanceState } from "@/effect/instance-state"
-import { Effect, Fiber, Layer, Queue, Scope, ServiceMap } from "effect"
+import { Effect, Fiber, Layer, Queue, Scope, Context } from "effect"
 import * as Stream from "effect/Stream"
 import z from "zod"
 import { APICallError, type ModelMessage } from "ai"
@@ -257,7 +257,7 @@ export namespace TieredCompaction {
     readonly model: { providerID: ProviderID; modelID: ModelID }
   }
 
-  export class Service extends ServiceMap.Service<Service, Interface>()("@opencode/TieredCompaction") {}
+  export class Service extends Context.Service<Service, Interface>()("@opencode/TieredCompaction") {}
 
   // ───────────────────────────────────────────────────────────────
   // Layer implementation

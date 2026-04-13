@@ -12,7 +12,7 @@ import { Config } from "@/config/config"
 import { ProviderID } from "@/provider/schema"
 import { ProviderTransform } from "@/provider/transform"
 import { LLM } from "./llm"
-import { Effect, Layer, ServiceMap } from "effect"
+import { Effect, Layer, Context } from "effect"
 import { NotFoundError } from "@/storage/db"
 import z from "zod"
 
@@ -234,7 +234,7 @@ The conversation context below shows what the user was working on. Use it to det
     extract: typeof extract
   }
 
-  export class Service extends ServiceMap.Service<Service, ServiceShape>()("@opencode/ToolExtraction") {}
+  export class Service extends Context.Service<Service, ServiceShape>()("@opencode/ToolExtraction") {}
 
   export const layer: Layer.Layer<
     Service,
