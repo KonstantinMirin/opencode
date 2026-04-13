@@ -24,6 +24,17 @@ import type { Provider } from "../../src/provider/provider"
 import * as SessionProcessorModule from "../../src/session/processor"
 import { Snapshot } from "../../src/snapshot"
 import { ProviderTest } from "../fake/provider"
+import { TieredCompaction } from "../../src/session/tiered-compaction"
+
+const tieredStub = Layer.succeed(
+  TieredCompaction.Service,
+  TieredCompaction.Service.of({
+    enqueue: () => Effect.succeed(void 0 as void),
+    check: () => Effect.succeed(false),
+    merge: () => Effect.succeed(void 0 as void),
+    pending: () => Effect.succeed(false),
+  }),
+)
 
 Log.init({ print: false })
 
@@ -175,6 +186,7 @@ function runtime(result: "continue" | "compact", plugin = Plugin.defaultLayer, p
       Layer.provide(plugin),
       Layer.provide(bus),
       Layer.provide(Config.defaultLayer),
+      Layer.provide(tieredStub),
     ),
   )
 }
@@ -217,6 +229,7 @@ function liveRuntime(layer: Layer.Layer<LLM.Service>, provider = ProviderTest.fa
       Layer.provide(status),
       Layer.provide(bus),
       Layer.provide(Config.defaultLayer),
+      Layer.provide(tieredStub),
     ),
   )
 }
@@ -462,7 +475,7 @@ describe("session.compaction.create", () => {
 })
 
 describe("session.compaction.prune", () => {
-  test("compacts old completed tool output", async () => {
+  test("compacts old completed tool output below Sieve threshold", async () => {
     await using tmp = await tmpdir()
     await Instance.provide({
       directory: tmp.path,
@@ -470,6 +483,34 @@ describe("session.compaction.prune", () => {
         const session = await Session.create({})
         const a = await user(session.id, "first")
         const b = await assistant(session.id, a.id, tmp.path)
+        // 15K chars ≈ 3750 tokens, below Sieve threshold (5K tokens)
+        // 20 outputs = 75K total tokens, exceeds PRUNE_PROTECT (40K) + PRUNE_MINIMUM (20K)
+        for (let i = 0; i < 20; i++) {
+          await tool(session.id, b.id, "bash", "x".repeat(15_000))
+        }
+        await user(session.id, "second")
+        await user(session.id, "third")
+
+        await SessionCompaction.prune({ sessionID: session.id })
+
+        const msgs = await Session.messages({ sessionID: session.id })
+        const compactedParts = msgs
+          .flatMap((msg) => msg.parts)
+          .filter((part) => part.type === "tool" && part.state.status === "completed" && part.state.time.compacted)
+        expect(compactedParts.length).toBeGreaterThan(0)
+      },
+    })
+  })
+
+  test("enqueues large tool output to Sieve instead of direct compaction", async () => {
+    await using tmp = await tmpdir()
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const session = await Session.create({})
+        const a = await user(session.id, "first")
+        const b = await assistant(session.id, a.id, tmp.path)
+        // Large output above Sieve threshold (5K tokens ≈ 20K chars)
         await tool(session.id, b.id, "bash", "x".repeat(200_000))
         await user(session.id, "second")
         await user(session.id, "third")
@@ -480,8 +521,10 @@ describe("session.compaction.prune", () => {
         const part = msgs.flatMap((msg) => msg.parts).find((part) => part.type === "tool")
         expect(part?.type).toBe("tool")
         expect(part?.state.status).toBe("completed")
+        // Large outputs are enqueued to Sieve, not immediately compacted
+        // They will be compacted asynchronously by the Sieve extractor
         if (part?.type === "tool" && part.state.status === "completed") {
-          expect(part.state.time.compacted).toBeNumber()
+          expect(part.state.time.compacted).toBeUndefined()
         }
       },
     })
@@ -662,7 +705,8 @@ describe("session.compaction.process", () => {
             synthetic: true,
           })
           if (last?.parts[0]?.type === "text") {
-            expect(last.parts[0].text).toContain("Continue if you have next steps")
+            expect(last.parts[0].text).toContain("Resume directly")
+            expect(last.parts[0].text).toContain(session.id)
           }
         } finally {
           await rt.dispose()

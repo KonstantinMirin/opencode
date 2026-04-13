@@ -20,6 +20,13 @@ import { tmpdir } from "../fixture/fixture"
 import type { Provider as ProviderType } from "../../src/provider/provider"
 import { ModelID, ProviderID } from "../../src/provider/schema"
 import { isOverflow } from "../../src/session/overflow"
+import {
+  extractRecentFiles,
+  formatFileReminders,
+  truncateToTokens,
+  REATTACH_LIMITS,
+  continuationWithSession,
+} from "../../src/session/compaction-prompt"
 
 Log.init({ print: false })
 
@@ -155,6 +162,8 @@ describe("tiered-compaction.merge", () => {
                 sessionID: session.id,
                 anchor: u1.id,
                 summary: "## Goal\nUser wants to build a feature.",
+                mode: "initial",
+                sourceRange: { from: u1.id, to: u1.id },
                 agent: "build",
                 model: ref,
               }),
@@ -196,6 +205,8 @@ describe("tiered-compaction.merge", () => {
                 sessionID: session.id,
                 anchor: u1.id,
                 summary: "first summary",
+                mode: "initial",
+                sourceRange: { from: u1.id, to: u1.id },
                 agent: "build",
                 model: ref,
               }),
@@ -210,6 +221,8 @@ describe("tiered-compaction.merge", () => {
                 sessionID: session.id,
                 anchor: u1.id,
                 summary: "second summary",
+                mode: "delta",
+                sourceRange: { from: u1.id, to: u1.id },
                 agent: "build",
                 model: ref,
               }),
@@ -257,6 +270,8 @@ describe("tiered-compaction.merge", () => {
                 sessionID: session.id,
                 anchor: ids[1],
                 summary: "Summary of turns 0-1",
+                mode: "initial",
+                sourceRange: { from: ids[0], to: ids[1] },
                 agent: "build",
                 model: ref,
               }),
@@ -575,7 +590,487 @@ describe("token.estimate", () => {
   })
 })
 
+// ─── Incremental Summarization: Helper tests ─────────────────────
+
+describe("tiered-compaction.findExistingSummary", () => {
+  test("returns null when no compaction boundary exists", () => {
+    const result = TieredCompaction.findExistingSummary([])
+    expect(result).toBeNull()
+  })
+
+  test("finds the latest compaction boundary with summary text", () => {
+    const sid = SessionID.make("test-session")
+    const uid0 = MessageID.ascending()
+    const boundaryId = MessageID.ascending()
+    const summaryId = MessageID.ascending()
+
+    // Chronological order: oldest first (boundary user msg, then summary assistant)
+    const msgs: MessageV2.WithParts[] = [
+      {
+        info: { id: boundaryId, sessionID: sid, role: "user" } as any,
+        parts: [
+          {
+            type: "compaction" as const,
+            auto: true,
+            anchor: uid0,
+            mode: "initial",
+            sourceRange: { from: uid0, to: uid0 },
+          },
+        ] as any[],
+      },
+      {
+        info: {
+          id: summaryId,
+          sessionID: sid,
+          role: "assistant",
+          parentID: boundaryId,
+          summary: true,
+          finish: "stop",
+        } as any,
+        parts: [{ type: "text" as const, text: "## Goal\nBuild feature X" }] as any[],
+      },
+    ]
+
+    const result = TieredCompaction.findExistingSummary(msgs)
+    expect(result).not.toBeNull()
+    expect(result!.summary).toBe("## Goal\nBuild feature X")
+    expect(result!.mode).toBe("initial")
+    expect(result!.sourceRange).toEqual({ from: uid0, to: uid0 })
+  })
+
+  test("finds delta mode from latest boundary", () => {
+    const sid = SessionID.make("test-session")
+    const uid0 = MessageID.ascending()
+    const firstBoundaryId = MessageID.ascending()
+    const firstSummaryId = MessageID.ascending()
+    const secondBoundaryId = MessageID.ascending()
+    const secondSummaryId = MessageID.ascending()
+
+    // Chronological order: oldest first
+    const msgs: MessageV2.WithParts[] = [
+      {
+        info: { id: firstBoundaryId, sessionID: sid, role: "user" } as any,
+        parts: [
+          {
+            type: "compaction" as const,
+            auto: true,
+            anchor: uid0,
+            mode: "initial",
+            sourceRange: { from: uid0, to: uid0 },
+          },
+        ] as any[],
+      },
+      {
+        info: {
+          id: firstSummaryId,
+          sessionID: sid,
+          role: "assistant",
+          parentID: firstBoundaryId,
+          summary: true,
+          finish: "stop",
+        } as any,
+        parts: [{ type: "text" as const, text: "Initial summary" }] as any[],
+      },
+      {
+        info: { id: secondBoundaryId, sessionID: sid, role: "user" } as any,
+        parts: [
+          {
+            type: "compaction" as const,
+            auto: true,
+            anchor: uid0,
+            mode: "delta",
+            sourceRange: { from: uid0, to: secondBoundaryId },
+          },
+        ] as any[],
+      },
+      {
+        info: {
+          id: secondSummaryId,
+          sessionID: sid,
+          role: "assistant",
+          parentID: secondBoundaryId,
+          summary: true,
+          finish: "stop",
+        } as any,
+        parts: [{ type: "text" as const, text: "Merged summary" }] as any[],
+      },
+    ]
+
+    const result = TieredCompaction.findExistingSummary(msgs)
+    expect(result).not.toBeNull()
+    expect(result!.mode).toBe("delta")
+    expect(result!.summary).toBe("Merged summary")
+  })
+
+  test("returns null mode for old compaction parts without mode field", () => {
+    const sid = SessionID.make("test-session")
+    const uid0 = MessageID.ascending()
+    const boundaryId = MessageID.ascending()
+    const summaryId = MessageID.ascending()
+
+    // Chronological order: boundary then summary
+    const msgs: MessageV2.WithParts[] = [
+      {
+        info: { id: boundaryId, sessionID: sid, role: "user" } as any,
+        parts: [{ type: "compaction" as const, auto: true, anchor: uid0 }] as any[],
+      },
+      {
+        info: {
+          id: summaryId,
+          sessionID: sid,
+          role: "assistant",
+          parentID: boundaryId,
+          summary: true,
+          finish: "stop",
+        } as any,
+        parts: [{ type: "text" as const, text: "Old summary" }] as any[],
+      },
+    ]
+
+    const result = TieredCompaction.findExistingSummary(msgs)
+    expect(result).not.toBeNull()
+    expect(result!.mode).toBeUndefined()
+    expect(result!.sourceRange).toBeUndefined()
+  })
+})
+
+describe("tiered-compaction.countDeltasSinceFull", () => {
+  test("returns 0 when there are no compaction boundaries", () => {
+    const result = TieredCompaction.countDeltasSinceFull([])
+    expect(result).toBe(0)
+  })
+
+  test("returns 0 when only initial/full boundary exists", () => {
+    const sid = SessionID.make("test-session")
+    const uid0 = MessageID.ascending()
+
+    const msgs: MessageV2.WithParts[] = [
+      {
+        info: { id: MessageID.ascending(), sessionID: sid, role: "user" } as any,
+        parts: [{ type: "compaction" as const, auto: true, anchor: uid0, mode: "initial" }] as any[],
+      },
+    ]
+
+    expect(TieredCompaction.countDeltasSinceFull(msgs)).toBe(0)
+  })
+
+  test("counts consecutive delta boundaries from the end", () => {
+    const sid = SessionID.make("test-session")
+    const uid0 = MessageID.ascending()
+
+    // Chronological: initial, then delta, then delta
+    const msgs: MessageV2.WithParts[] = [
+      {
+        info: { id: MessageID.ascending(), sessionID: sid, role: "user" } as any,
+        parts: [{ type: "compaction" as const, auto: true, anchor: uid0, mode: "initial" }] as any[],
+      },
+      {
+        info: { id: MessageID.ascending(), sessionID: sid, role: "user" } as any,
+        parts: [{ type: "compaction" as const, auto: true, anchor: uid0, mode: "delta" }] as any[],
+      },
+      {
+        info: { id: MessageID.ascending(), sessionID: sid, role: "user" } as any,
+        parts: [{ type: "compaction" as const, auto: true, anchor: uid0, mode: "delta" }] as any[],
+      },
+    ]
+
+    expect(TieredCompaction.countDeltasSinceFull(msgs)).toBe(2)
+  })
+
+  test("stops counting at non-delta boundary", () => {
+    const sid = SessionID.make("test-session")
+    const uid0 = MessageID.ascending()
+
+    // Chronological: delta, then initial, then delta
+    const msgs: MessageV2.WithParts[] = [
+      {
+        info: { id: MessageID.ascending(), sessionID: sid, role: "user" } as any,
+        parts: [{ type: "compaction" as const, auto: true, anchor: uid0, mode: "delta" }] as any[],
+      },
+      {
+        info: { id: MessageID.ascending(), sessionID: sid, role: "user" } as any,
+        parts: [{ type: "compaction" as const, auto: true, anchor: uid0, mode: "initial" }] as any[],
+      },
+      {
+        info: { id: MessageID.ascending(), sessionID: sid, role: "user" } as any,
+        parts: [{ type: "compaction" as const, auto: true, anchor: uid0, mode: "delta" }] as any[],
+      },
+    ]
+
+    expect(TieredCompaction.countDeltasSinceFull(msgs)).toBe(1)
+  })
+})
+
+describe("tiered-compaction.merge with mode and sourceRange", () => {
+  test("writes initial mode and sourceRange on compaction part", async () => {
+    await using tmp = await tmpdir()
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const rt = runtime()
+        try {
+          const session = await Session.create({})
+          const u1 = await user(session.id, "turn 0")
+          await assistant(session.id, u1.id, tmp.path)
+          const u2 = await user(session.id, "turn 1")
+
+          await rt.runPromise(
+            TieredCompaction.Service.use((svc) =>
+              svc.merge({
+                sessionID: session.id,
+                anchor: u1.id,
+                summary: "Initial compaction summary",
+                mode: "initial",
+                sourceRange: { from: u1.id, to: u1.id },
+                agent: "build",
+                model: ref,
+              }),
+            ),
+          )
+
+          const msgs = await Session.messages({ sessionID: session.id })
+          const boundary = msgs.find((m) => m.info.role === "user" && m.parts.some((p) => p.type === "compaction"))
+          expect(boundary).toBeDefined()
+
+          const cp = boundary!.parts.find((p): p is MessageV2.CompactionPart => p.type === "compaction")
+          expect(cp).toBeDefined()
+          expect(cp!.mode).toBe("initial")
+          expect(cp!.sourceRange).toEqual({ from: u1.id, to: u1.id })
+        } finally {
+          await rt.dispose()
+        }
+      },
+    })
+  })
+
+  test("writes delta mode on subsequent compaction", async () => {
+    await using tmp = await tmpdir()
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const rt = runtime()
+        try {
+          const session = await Session.create({})
+          const u1 = await user(session.id, "turn 0")
+          await assistant(session.id, u1.id, tmp.path)
+          const u2 = await user(session.id, "turn 1")
+
+          await rt.runPromise(
+            TieredCompaction.Service.use((svc) =>
+              svc.merge({
+                sessionID: session.id,
+                anchor: u1.id,
+                summary: "Delta compaction",
+                mode: "delta",
+                sourceRange: { from: u1.id, to: u2.id },
+                agent: "build",
+                model: ref,
+              }),
+            ),
+          )
+
+          const msgs = await Session.messages({ sessionID: session.id })
+          const boundary = msgs.find((m) => m.info.role === "user" && m.parts.some((p) => p.type === "compaction"))
+          const cp = boundary!.parts.find((p): p is MessageV2.CompactionPart => p.type === "compaction")
+          expect(cp!.mode).toBe("delta")
+          expect(cp!.sourceRange).toEqual({ from: u1.id, to: u2.id })
+        } finally {
+          await rt.dispose()
+        }
+      },
+    })
+  })
+
+  test("writes full mode on forced re-summary", async () => {
+    await using tmp = await tmpdir()
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const rt = runtime()
+        try {
+          const session = await Session.create({})
+          const u1 = await user(session.id, "turn 0")
+          await assistant(session.id, u1.id, tmp.path)
+
+          await rt.runPromise(
+            TieredCompaction.Service.use((svc) =>
+              svc.merge({
+                sessionID: session.id,
+                anchor: u1.id,
+                summary: "Full re-summary from source",
+                mode: "full",
+                sourceRange: { from: u1.id, to: u1.id },
+                agent: "build",
+                model: ref,
+              }),
+            ),
+          )
+
+          const msgs = await Session.messages({ sessionID: session.id })
+          const boundary = msgs.find((m) => m.info.role === "user" && m.parts.some((p) => p.type === "compaction"))
+          const cp = boundary!.parts.find((p): p is MessageV2.CompactionPart => p.type === "compaction")
+          expect(cp!.mode).toBe("full")
+        } finally {
+          await rt.dispose()
+        }
+      },
+    })
+  })
+})
+
+describe("MessageV2.streamRange", () => {
+  test("yields messages within ID range", async () => {
+    await using tmp = await tmpdir()
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const session = await Session.create({})
+        const u1 = await user(session.id, "turn 0")
+        const a1 = await assistant(session.id, u1.id, tmp.path)
+        const u2 = await user(session.id, "turn 1")
+        const a2 = await assistant(session.id, u2.id, tmp.path)
+
+        const ranged = [...MessageV2.streamRange(session.id, u1.id, a2.id)]
+        const ids = ranged.map((m) => m.info.id)
+        expect(ids).toContain(u1.id)
+        expect(ids).toContain(a1.id)
+        expect(ids).toContain(u2.id)
+        expect(ids).toContain(a2.id)
+      },
+    })
+  })
+
+  test("returns empty for range with no messages", async () => {
+    await using tmp = await tmpdir()
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const session = await Session.create({})
+        const start = MessageID.ascending()
+        const end = MessageID.ascending()
+        const ranged = [...MessageV2.streamRange(session.id, start, end)]
+        expect(ranged).toHaveLength(0)
+      },
+    })
+  })
+})
+
+// ─── P5: File re-attachment helpers ─────────────────────────────────
+
+describe("compaction-prompt.extractRecentFiles", () => {
+  function makeMsg(toolParts: { tool: string; input: Record<string, any> }[]) {
+    return {
+      info: { id: MessageID.ascending(), role: "assistant" as const },
+      parts: toolParts.map((p) => ({
+        type: "tool" as const,
+        id: PartID.ascending(),
+        messageID: MessageID.ascending(),
+        sessionID: SessionID.make("s1"),
+        callID: crypto.randomUUID(),
+        tool: p.tool,
+        state: {
+          status: "completed" as const,
+          input: p.input,
+          output: "ok",
+          title: "done",
+          metadata: {},
+          time: { start: Date.now(), end: Date.now() },
+        },
+      })),
+    }
+  }
+
+  test("extracts absolute paths from file-reading tools", () => {
+    const msgs = [
+      makeMsg([{ tool: "read", input: { filePath: "/foo/bar.ts" } }]),
+      makeMsg([{ tool: "edit", input: { filePath: "/baz/qux.ts" } }]),
+    ]
+    const paths = extractRecentFiles(msgs as any)
+    expect(paths).toEqual(["/baz/qux.ts", "/foo/bar.ts"])
+  })
+
+  test("deduplicates paths", () => {
+    const msgs = [
+      makeMsg([{ tool: "read", input: { filePath: "/foo.ts" } }]),
+      makeMsg([{ tool: "edit", input: { filePath: "/foo.ts" } }]),
+    ]
+    const paths = extractRecentFiles(msgs as any)
+    expect(paths).toEqual(["/foo.ts"])
+  })
+
+  test("skips non-file tools", () => {
+    const msgs = [makeMsg([{ tool: "bash", input: { command: "ls" } }])]
+    const paths = extractRecentFiles(msgs as any)
+    expect(paths).toEqual([])
+  })
+
+  test("skips relative paths", () => {
+    const msgs = [makeMsg([{ tool: "read", input: { filePath: "relative/path.ts" } }])]
+    const paths = extractRecentFiles(msgs as any)
+    expect(paths).toEqual([])
+  })
+
+  test("caps at MAX_REATTACH_FILES", () => {
+    const msgs = Array.from({ length: 10 }, (_, i) => makeMsg([{ tool: "read", input: { filePath: `/file${i}.ts` } }]))
+    const paths = extractRecentFiles(msgs as any)
+    expect(paths.length).toBe(REATTACH_LIMITS.maxFiles)
+  })
+
+  test("prefers most recent files", () => {
+    const msgs = [
+      makeMsg([{ tool: "read", input: { filePath: "/old.ts" } }]),
+      makeMsg([{ tool: "read", input: { filePath: "/new.ts" } }]),
+    ]
+    const paths = extractRecentFiles(msgs as any)
+    expect(paths[0]).toBe("/new.ts")
+  })
+})
+
+describe("compaction-prompt.formatFileReminders", () => {
+  test("returns empty string for empty entries", () => {
+    expect(formatFileReminders([])).toBe("")
+  })
+
+  test("formats entries as system-reminder blocks", () => {
+    const result = formatFileReminders([{ path: "/foo.ts", content: "hello" }])
+    expect(result).toContain("<system-reminder>")
+    expect(result).toContain("/foo.ts")
+    expect(result).toContain("hello")
+    expect(result).toContain("</system-reminder>")
+  })
+})
+
+describe("compaction-prompt.truncateToTokens", () => {
+  test("does not truncate short text", () => {
+    expect(truncateToTokens("hello", 100)).toBe("hello")
+  })
+
+  test("truncates long text", () => {
+    const long = "x".repeat(1000)
+    const result = truncateToTokens(long, 10)
+    expect(result.length).toBeLessThan(long.length)
+    expect(result).toContain("truncated")
+  })
+})
+
+describe("TieredCompaction.isContextOverflow", () => {
+  test("returns false for non-APICallError", () => {
+    expect(TieredCompaction.isContextOverflow(new Error("generic"))).toBe(false)
+    expect(TieredCompaction.isContextOverflow(null)).toBe(false)
+    expect(TieredCompaction.isContextOverflow("string")).toBe(false)
+  })
+})
+
 // ─── Helper: runtime setup ────────────────────────────────────────
+
+describe("compaction-prompt.continuationWithSession", () => {
+  test("includes session ID in continuation prompt", () => {
+    const result = continuationWithSession("sess_abc123")
+    expect(result).toContain("Resume directly")
+    expect(result).toContain("sess_abc123")
+    expect(result).toContain("full conversation history is preserved")
+  })
+})
 
 function runtime() {
   const bus = Bus.layer

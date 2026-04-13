@@ -208,11 +208,24 @@ export namespace MessageV2 {
   })
   export type AgentPart = z.infer<typeof AgentPart>
 
+  export const CompactionMode = z.enum(["initial", "delta", "full"]).meta({ ref: "CompactionMode" })
+  export type CompactionMode = z.infer<typeof CompactionMode>
+
+  export const SourceRange = z
+    .object({
+      from: MessageID.zod,
+      to: MessageID.zod,
+    })
+    .meta({ ref: "SourceRange" })
+  export type SourceRange = z.infer<typeof SourceRange>
+
   export const CompactionPart = PartBase.extend({
     type: z.literal("compaction"),
     auto: z.boolean(),
     overflow: z.boolean().optional(),
     anchor: MessageID.zod.optional(),
+    mode: CompactionMode.optional(),
+    sourceRange: SourceRange.optional(),
   }).meta({
     ref: "CompactionPart",
   })
@@ -901,6 +914,14 @@ export namespace MessageV2 {
       }
       if (!next.more || !next.cursor) break
       before = next.cursor
+    }
+  }
+
+  /** Fetch messages from `from` ID through `to` ID (inclusive), in chronological order */
+  export function* streamRange(sessionID: SessionID, from: MessageID, to: MessageID) {
+    for (const msg of stream(sessionID)) {
+      if (msg.info.id >= from && msg.info.id <= to) yield msg
+      if (msg.info.id > to) break
     }
   }
 

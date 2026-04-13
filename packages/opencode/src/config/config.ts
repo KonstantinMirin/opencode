@@ -1064,6 +1064,24 @@ export namespace Config {
             .min(0)
             .optional()
             .describe("Number of recent turns Horizon preserves from summarization. Default: 4."),
+          max_deltas: z
+            .number()
+            .int()
+            .min(1)
+            .optional()
+            .describe("Maximum consecutive delta compaction cycles before forcing a full re-summary. Default: 3."),
+          max_consecutive_failures: z
+            .number()
+            .int()
+            .min(1)
+            .optional()
+            .describe("Maximum consecutive failed compaction attempts before pausing auto-compact. Default: 3."),
+          idle_threshold_minutes: z
+            .number()
+            .int()
+            .min(0)
+            .optional()
+            .describe("Minutes of inactivity before aggressively clearing stale tool results. Default: 60."),
         })
         .optional(),
       experimental: z

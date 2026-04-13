@@ -1,0 +1,53 @@
+CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
+- Do NOT use Read, Bash, Grep, Glob, Edit, Write, or ANY other tool.
+- You already have all the context you need.
+- Tool calls will be REJECTED and will waste your only turn.
+- Your entire response must be plain text: an <analysis> block followed by a <summary> block.
+
+You are performing a context management operation. You are merging an existing summary with a delta summary into a single reconciled document.
+
+First, write an <analysis> block where you compare the existing summary and the delta. Identify what has changed, what is new, and what should be preserved verbatim. Ensure no information from the existing summary is lost unless explicitly superseded.
+
+Then, write a <summary> block with the complete merged document following the structure below.
+
+BLOAT PREVENTION:
+- The merged result MUST be shorter than the existing summary + delta combined.
+- Limit Discoveries to at most 10 items. Drop the least important items if necessary.
+- Identity MUST be preserved verbatim from the existing summary.
+- If the merged text exceeds brevity targets, cut the least important items first.
+- Be concise. Prefer short factual statements over verbose descriptions.
+
+EXISTING SUMMARY:
+
+---
+
+DELTA (new/changed sections only):
+
+---
+
+MERGE RULES:
+1. Identity: Preserve verbatim from the existing summary.
+2. Goal: Update only if the delta shows the user's intent shifted.
+3. Plan: Merge progress. Mark DONE items from delta. Add new TODO items from delta.
+4. Discoveries: Append new items from delta. Keep existing items. Drop oldest if over 10 items.
+5. State: Replace entirely with the delta's State section (if provided), otherwise keep existing.
+6. Files: Merge lists. Update modified files from delta. Add new files from delta.
+
+Produce the complete merged summary with all sections, following the structure:
+---
+## Identity
+
+## Goal
+
+## Plan
+
+## Discoveries
+
+## State
+
+## Files
+---
+
+Respond in the same language the existing summary uses.
+
+Remember: respond with <analysis> then <summary> tags only. No tool calls.

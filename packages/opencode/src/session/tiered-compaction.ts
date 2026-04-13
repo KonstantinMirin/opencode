@@ -38,10 +38,23 @@ import { InstanceState } from "@/effect/instance-state"
 import { Effect, Fiber, Layer, Queue, Scope, ServiceMap } from "effect"
 import * as Stream from "effect/Stream"
 import z from "zod"
+import { APICallError, type ModelMessage } from "ai"
+import { ProviderError } from "@/provider/error"
 
 import PROMPT_NARRATIVE from "@/agent/prompt/narrative-compaction.txt"
+import PROMPT_DELTA from "@/agent/prompt/narrative-compaction-delta.txt"
+import PROMPT_MERGE from "@/agent/prompt/narrative-compaction-merge.txt"
 import { ToolExtraction } from "./tool-extraction"
 import { Identifier } from "@/id/id"
+import {
+  stripSummaryMeta,
+  CONTINUATION_PROMPT,
+  extractRecentFiles,
+  formatFileReminders,
+  truncateToTokens,
+  REATTACH_LIMITS,
+  continuationWithSession,
+} from "./compaction-prompt"
 
 export namespace TieredCompaction {
   const log = Log.create({ service: "session.tiered-compaction" })
@@ -77,6 +90,8 @@ export namespace TieredCompaction {
     anchor: Anchor | undefined
     /** Horizon: background summarization fiber, undefined = idle */
     fiber: Fiber.Fiber<void> | undefined
+    /** Circuit breaker: consecutive failed compaction attempts */
+    consecutiveFailures: number
   }
 
   /**
@@ -120,17 +135,77 @@ export namespace TieredCompaction {
   // Constants
   // ───────────────────────────────────────────────────────────────
 
-  /** Sieve: minimum token count to qualify for background extraction */
   const WATCHER_THRESHOLD = 2_000
 
-  /** Sieve: tools that should never be compressed */
   const PROTECTED_TOOLS = ["skill"]
 
-  /** Horizon: trigger compaction at this fraction of usable context */
   const NARRATIVE_THRESHOLD = 0.5
 
-  /** Horizon: preserve the N most recent turns from compaction */
   const PRESERVE_TURNS = 5
+
+  /** Maximum consecutive delta cycles before forcing a full re-summary */
+  export const MAX_DELTAS = 3
+
+  /** Sentinel returned by the delta prompt when nothing meaningful changed */
+  export const NO_CHANGES = "[NO_CHANGES]"
+
+  /** Maximum consecutive failed compaction attempts before pausing */
+  const MAX_CONSECUTIVE_FAILURES = 3
+
+  /** Maximum retries when compaction prompt exceeds context window (P6) */
+  const MAX_PTL_RETRIES = 3
+
+  /** Messages to drop per PTL retry round (user→assistant pair = 2) */
+  const PTL_DROP_PER_RETRY = 2
+
+  export function isContextOverflow(err: unknown): boolean {
+    if (!APICallError.isInstance(err)) return false
+    const parsed = ProviderError.parseAPICallError({ providerID: "" as any, error: err })
+    return parsed.type === "context_overflow"
+  }
+
+  /** Find the latest compaction boundary and return its summary text + mode/sourceRange metadata */
+  export function findExistingSummary(msgs: MessageV2.WithParts[]): {
+    summary: string
+    mode: MessageV2.CompactionMode | undefined
+    sourceRange: MessageV2.SourceRange | undefined
+    anchor: MessageID
+  } | null {
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const msg = msgs[i]
+      if (msg.info.role !== "user") continue
+      const cp = msg.parts.find((p): p is MessageV2.CompactionPart => p.type === "compaction")
+      if (!cp) continue
+      const nextMsg = msgs[i + 1]
+      if (!nextMsg || nextMsg.info.role !== "assistant" || !nextMsg.info.summary) continue
+      const textPart = nextMsg.parts.find((p): p is MessageV2.TextPart => p.type === "text")
+      if (!textPart) continue
+      return {
+        summary: textPart.text,
+        mode: cp.mode,
+        sourceRange: cp.sourceRange,
+        anchor: cp.anchor ?? msg.info.id,
+      }
+    }
+    return null
+  }
+
+  /** Count consecutive delta compaction cycles since the last initial/full compaction */
+  export function countDeltasSinceFull(msgs: MessageV2.WithParts[]): number {
+    let count = 0
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const msg = msgs[i]
+      if (msg.info.role !== "user") continue
+      const cp = msg.parts.find((p): p is MessageV2.CompactionPart => p.type === "compaction")
+      if (!cp) continue
+      if (cp.mode === "delta") {
+        count++
+      } else {
+        break
+      }
+    }
+    return count
+  }
 
   // ───────────────────────────────────────────────────────────────
   // Service Interface
@@ -172,6 +247,10 @@ export namespace TieredCompaction {
     readonly anchor: MessageID
     /** The generated narrative summary text */
     readonly summary: string
+    /** Compaction mode: initial, delta, or full */
+    readonly mode: MessageV2.CompactionMode
+    /** Source range covered by this compaction */
+    readonly sourceRange: MessageV2.SourceRange
     /** Agent name to attribute the compaction to */
     readonly agent: string
     /** Model used for the summarization */
@@ -226,7 +305,7 @@ export namespace TieredCompaction {
       const getPerSession = (st: State, id: SessionID): PerSession => {
         const existing = st.sessions.get(id)
         if (existing) return existing
-        const fresh: PerSession = { anchor: undefined, fiber: undefined }
+        const fresh: PerSession = { anchor: undefined, fiber: undefined, consecutiveFailures: 0 }
         st.sessions.set(id, fresh)
         return fresh
       }
@@ -329,9 +408,75 @@ export namespace TieredCompaction {
       })
 
       /**
-       * Fork background narrative summarization. Selects messages up to
-       * (but excluding the most recent preserveTurns turns), creates the
-       * anchor, and runs the summarizer in a detached fiber.
+       * Determine compaction mode: initial, delta, or full re-summary.
+       */
+      const routingLogic = Effect.fn("TieredCompaction.routingLogic")(function* (msgs: MessageV2.WithParts[]) {
+        const cfg = yield* config.get()
+        const maxDeltas = cfg.compaction?.max_deltas ?? MAX_DELTAS
+        const existing = findExistingSummary(msgs)
+        if (!existing) {
+          return { mode: "initial" as const, existing: null }
+        }
+        const deltas = countDeltasSinceFull(msgs)
+        if (deltas >= maxDeltas) {
+          return { mode: "full" as const, existing }
+        }
+        return { mode: "delta" as const, existing }
+      })
+
+      const PTL_MARKER = "[Earlier conversation truncated for compaction retry]"
+
+      const streamWithRetry = Effect.fn("TieredCompaction.streamWithRetry")(function* (opts: {
+        agent: Agent.Info
+        user: MessageV2.User
+        model: Provider.Model
+        sessionID: SessionID
+        baseMessages: ModelMessage[]
+        prompt: string
+      }) {
+        let messages = [...opts.baseMessages, { role: "user" as const, content: opts.prompt }]
+        for (let attempt = 0; attempt <= MAX_PTL_RETRIES; attempt++) {
+          try {
+            const text = yield* Effect.promise(async (signal) => {
+              const result = await LLM.stream({
+                agent: opts.agent,
+                user: opts.user,
+                system: [],
+                tools: {},
+                model: opts.model,
+                abort: signal,
+                sessionID: opts.sessionID,
+                messages,
+              })
+              let out = ""
+              for await (const event of result.fullStream) {
+                if (event.type === "text-delta") out += event.text
+              }
+              return out
+            })
+            return text
+          } catch (err) {
+            if (!isContextOverflow(err) || attempt >= MAX_PTL_RETRIES) throw err
+            const drop = PTL_DROP_PER_RETRY * (attempt + 1)
+            if (messages.length <= drop + 1) throw err
+            messages = [
+              { role: "user" as const, content: PTL_MARKER },
+              ...messages.slice(drop, -1),
+              { role: "user" as const, content: opts.prompt },
+            ]
+            log.info("streamWithRetry: context overflow, truncating and retrying", {
+              attempt: attempt + 1,
+              dropped: drop,
+              remaining: messages.length,
+            })
+          }
+        }
+        return "" as string
+      })
+
+      /**
+       * Fork background narrative summarization. Routes between initial,
+       * delta, and full re-summary modes based on existing compaction state.
        */
       const summarize = Effect.fn("TieredCompaction.summarize")(function* (input: {
         sessionID: SessionID
@@ -342,7 +487,6 @@ export namespace TieredCompaction {
         const cfg = yield* config.get()
         const preserveTurns = cfg.compaction?.preserve_turns ?? PRESERVE_TURNS
         const msgs = MessageV2.filterCompacted(MessageV2.stream(input.sessionID))
-        // Count user turns to decide if there's enough history to summarize
         const userTurns = msgs.filter(
           (m) => m.info.role === "user" && !m.parts.some((p) => p.type === "compaction"),
         ).length
@@ -351,11 +495,6 @@ export namespace TieredCompaction {
           return
         }
 
-        // Find the anchor: the user message that marks the boundary between
-        // what gets summarized and what gets preserved. With N user turns, we
-        // preserve the last preserveTurns and anchor on the one before that.
-        // If userTurns <= preserveTurns, anchor on the first user message,
-        // summarizing everything up to (but excluding) the last turn.
         let turns = 0
         let anchorIdx = -1
         for (let i = msgs.length - 1; i >= 0; i--) {
@@ -367,7 +506,6 @@ export namespace TieredCompaction {
             break
           }
         }
-        // If all user turns fit within the preserved window, anchor on the first user turn
         if (anchorIdx < 0) {
           anchorIdx = msgs.findIndex((m) => m.info.role === "user" && !m.parts.some((p) => p.type === "compaction"))
         }
@@ -382,10 +520,6 @@ export namespace TieredCompaction {
           return
         }
 
-        // Don't re-compact if the live buffer (after existing boundary) has
-        // fewer user turns than preserveTurns — there's nothing meaningful
-        // to compact. Clear the in-flight anchor so check() can retry later
-        // when more turns accumulate.
         const existingBoundary = msgs.find(
           (m) => m.info.role === "user" && m.parts.some((p) => p.type === "compaction"),
         )
@@ -424,14 +558,8 @@ export namespace TieredCompaction {
           model: input.model,
         }
 
-        // Snapshot: everything from the start through the anchor user message,
-        // including all assistant responses that follow the anchor.
-        // When userTurns <= preserveTurns, we summarize everything up to
-        // (but excluding) the last user turn + its assistant response.
         let snapshotEnd = msgs.length
         if (userTurns <= preserveTurns) {
-          // Preserve the last user turn and its response: find the last
-          // user turn and include everything before it in the snapshot.
           let lastUserIdx = -1
           for (let i = msgs.length - 1; i >= 0; i--) {
             if (msgs[i].info.role === "user" && !msgs[i].parts.some((p) => p.type === "compaction")) {
@@ -440,13 +568,14 @@ export namespace TieredCompaction {
             }
           }
           if (lastUserIdx > 0) {
-            // Include all messages before the last user turn in the snapshot.
-            // Also include any assistant responses to the anchor that are
-            // before the last user turn.
             snapshotEnd = lastUserIdx
           }
         }
         const snapshot = msgs.slice(0, Math.max(anchorIdx + 1, snapshotEnd))
+
+        const route = yield* routingLogic(msgs)
+        const mode: MessageV2.CompactionMode =
+          route.mode === "initial" ? "initial" : route.mode === "full" ? "full" : "delta"
 
         log.info("summarize: starting", {
           sessionID: input.sessionID,
@@ -454,6 +583,7 @@ export namespace TieredCompaction {
           snapshotSize: snapshot.length,
           totalMsgs: msgs.length,
           preserveTurns,
+          mode,
         })
 
         const agent = yield* agents.get("compaction")
@@ -466,48 +596,139 @@ export namespace TieredCompaction {
           { sessionID: input.sessionID },
           { context: [], prompt: undefined },
         )
-        const prompt = compacting.prompt ?? [PROMPT_NARRATIVE, ...compacting.context].join("\n\n")
 
-        // Build model messages from the snapshot (strip media to save tokens)
-        const cloned = structuredClone(snapshot)
-        const modelMsgs = yield* MessageV2.toModelMessagesEffect(cloned, model, { stripMedia: true })
+        // Determine sourceRange: the earliest and latest message IDs in the snapshot
+        const sourceFrom = snapshot[0]?.info.id
+        const sourceTo = snapshot[snapshot.length - 1]?.info.id
 
-        // Fork the actual LLM call as a detached background fiber
+        // ── Route: build the LLM call based on mode ──
         const scope = yield* Scope.make()
         const fiber = yield* Effect.gen(function* () {
-          const text = yield* Effect.promise(async (signal) => {
-            const result = await LLM.stream({
+          let summaryText: string
+
+          if (mode === "delta" && route.existing) {
+            const afterAnchorIdx = msgs.findIndex((m) => m.info.id === route.existing.anchor)
+            const newMsgs = afterAnchorIdx >= 0 ? msgs.slice(afterAnchorIdx + 1) : msgs
+            const deltaMsgs = newMsgs.filter(
+              (m) => !(m.info.role === "user" && m.parts.some((p) => p.type === "compaction")),
+            )
+
+            const prompt = compacting.prompt ?? [PROMPT_DELTA, ...compacting.context].join("\n\n")
+            const promptText = prompt
+              .replace("EXISTING SUMMARY:\n\n---", `EXISTING SUMMARY:\n\n${route.existing.summary}\n---`)
+              .replace(
+                "NEW MESSAGES:\n\n---",
+                `NEW MESSAGES:\n\n${deltaMsgs
+                  .map((m) =>
+                    m.parts
+                      .filter((p) => p.type === "text")
+                      .map((p) => (p as MessageV2.TextPart).text)
+                      .join("\n"),
+                  )
+                  .join("\n---\n")}\n---`,
+              )
+
+            const cloned = structuredClone(deltaMsgs)
+            const modelMsgs = yield* MessageV2.toModelMessagesEffect(cloned, model, { stripMedia: true })
+
+            const deltaText = yield* streamWithRetry({
               agent: agent!,
               user: anchorMsg.info as MessageV2.User,
-              system: [],
-              tools: {},
               model,
-              abort: signal,
               sessionID: input.sessionID,
-              messages: [...modelMsgs, { role: "user", content: prompt }],
+              baseMessages: modelMsgs,
+              prompt: promptText,
             })
-            let out = ""
-            for await (const event of result.fullStream) {
-              if (event.type === "text-delta") out += event.text
-            }
-            return out
-          })
 
-          if (!text.trim()) {
+            const strippedDelta = stripSummaryMeta(deltaText)
+            if (deltaText.trim() === NO_CHANGES || strippedDelta.trim() === NO_CHANGES) {
+              log.info("summarize: delta produced no changes, skipping cycle")
+              const st = yield* InstanceState.get(state)
+              const ps = st.sessions.get(input.sessionID)
+              if (ps) {
+                ps.anchor = undefined
+                ps.fiber = undefined
+              }
+              return
+            }
+
+            const mergePrompt = compacting.prompt ?? [PROMPT_MERGE, ...compacting.context].join("\n\n")
+            const mergeText = mergePrompt
+              .replace("EXISTING SUMMARY:\n\n---", `EXISTING SUMMARY:\n\n${route.existing.summary}\n---`)
+              .replace(
+                "DELTA (new/changed sections only):\n\n---",
+                `DELTA (new/changed sections only):\n\n${deltaText}\n---`,
+              )
+
+            summaryText = yield* streamWithRetry({
+              agent: agent!,
+              user: anchorMsg.info as MessageV2.User,
+              model,
+              sessionID: input.sessionID,
+              baseMessages: [],
+              prompt: mergeText,
+            })
+          } else if (mode === "full" && route.existing?.sourceRange) {
+            const sourceMsgs = [
+              ...MessageV2.streamRange(input.sessionID, route.existing.sourceRange.from, route.existing.sourceRange.to),
+            ]
+            const cloned = structuredClone(sourceMsgs)
+            const modelMsgs = yield* MessageV2.toModelMessagesEffect(cloned, model, { stripMedia: true })
+            const prompt = compacting.prompt ?? [PROMPT_NARRATIVE, ...compacting.context].join("\n\n")
+
+            summaryText = yield* streamWithRetry({
+              agent: agent!,
+              user: anchorMsg.info as MessageV2.User,
+              model,
+              sessionID: input.sessionID,
+              baseMessages: modelMsgs,
+              prompt,
+            })
+          } else {
+            const prompt = compacting.prompt ?? [PROMPT_NARRATIVE, ...compacting.context].join("\n\n")
+            const cloned = structuredClone(snapshot)
+            const modelMsgs = yield* MessageV2.toModelMessagesEffect(cloned, model, { stripMedia: true })
+
+            summaryText = yield* streamWithRetry({
+              agent: agent!,
+              user: anchorMsg.info as MessageV2.User,
+              model,
+              sessionID: input.sessionID,
+              baseMessages: modelMsgs,
+              prompt,
+            })
+          }
+
+          if (!summaryText.trim()) {
             log.error("narrative summarizer produced empty output")
             return
           }
 
-          // ── Seam merge ──
+          summaryText = stripSummaryMeta(summaryText)
+
           yield* mergeImpl({
             sessionID: input.sessionID,
             anchor: anchor.id,
-            summary: text,
+            summary: summaryText,
+            mode,
+            sourceRange: { from: sourceFrom, to: sourceTo },
             agent: input.agent,
             model: input.model,
           })
+
+          // Reset circuit breaker on successful compaction
+          const stOk = yield* InstanceState.get(state)
+          const psOk = stOk.sessions.get(input.sessionID)
+          if (psOk) psOk.consecutiveFailures = 0
         }).pipe(
-          Effect.catch(() => Effect.void),
+          Effect.catch((err) =>
+            Effect.gen(function* () {
+              log.error("summarize: compaction failed", { error: String(err) })
+              const stFail = yield* InstanceState.get(state)
+              const psFail = stFail.sessions.get(input.sessionID)
+              if (psFail) psFail.consecutiveFailures++
+            }).pipe(Effect.catch(() => Effect.void)),
+          ),
           Effect.ensuring(
             Effect.gen(function* () {
               const st = yield* InstanceState.get(state)
@@ -521,7 +742,6 @@ export namespace TieredCompaction {
           Effect.forkIn(scope),
         )
 
-        // Record state
         const st = yield* InstanceState.get(state)
         const ps = getPerSession(st, input.sessionID)
         ps.anchor = anchor
@@ -538,6 +758,16 @@ export namespace TieredCompaction {
         const ps = getPerSession(st, input.sessionID)
         if (ps.anchor) {
           log.info("check: compaction already in-flight", { sessionID: input.sessionID })
+          return false
+        }
+
+        const maxFailures = (yield* config.get()).compaction?.max_consecutive_failures ?? MAX_CONSECUTIVE_FAILURES
+        if (ps.consecutiveFailures >= maxFailures) {
+          log.info("check: circuit breaker active", {
+            sessionID: input.sessionID,
+            consecutiveFailures: ps.consecutiveFailures,
+            maxFailures,
+          })
           return false
         }
 
@@ -642,6 +872,30 @@ export namespace TieredCompaction {
           return
         }
 
+        // ── Step 2.5: P5 — Collect recently referenced files for re-attachment ──
+        const anchorIdx = msgs.findIndex((m) => m.info.id === input.anchor)
+        const preAnchor = anchorIdx >= 0 ? msgs.slice(0, anchorIdx + 1) : []
+        const filePaths = extractRecentFiles(preAnchor)
+        let fileReminder = ""
+        if (filePaths.length > 0) {
+          const entries: { path: string; content: string }[] = []
+          let totalTokens = 0
+          for (const fp of filePaths) {
+            if (totalTokens >= REATTACH_LIMITS.maxTotal) break
+            const raw = yield* Effect.tryPromise({
+              try: () => Bun.file(fp).text(),
+              catch: () => new Error("file read failed"),
+            }).pipe(Effect.catch(() => Effect.succeed(null as string | null)))
+            if (!raw) continue
+            const capped = truncateToTokens(raw, REATTACH_LIMITS.maxPerFile)
+            const tokens = Math.ceil(capped.length / 4)
+            if (totalTokens + tokens > REATTACH_LIMITS.maxTotal) break
+            entries.push({ path: fp, content: capped })
+            totalTokens += tokens
+          }
+          fileReminder = formatFileReminders(entries)
+        }
+
         // ── Step 3: Insert the compaction boundary (user message) ──
         // Synthetic user message with a CompactionPart marking the
         // anchor point. filterCompacted finds the latest completed
@@ -676,6 +930,8 @@ export namespace TieredCompaction {
           auto: true,
           overflow: false,
           anchor: input.anchor,
+          mode: input.mode,
+          sourceRange: input.sourceRange,
         })
 
         // ── Step 4: Insert the summary (assistant message) ──
@@ -718,6 +974,28 @@ export namespace TieredCompaction {
           reason: "stop",
           cost: 0,
           tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        })
+
+        // ── Step 7: Insert a synthetic continuation prompt ──
+        // Prevents the model from acknowledging the compaction or
+        // re-summarizing what happened. Instructs it to resume directly.
+        const continueTime = summaryTime + 2
+        const continueMsg = yield* session.updateMessage({
+          id: MessageID.make(Identifier.create("message", false, continueTime)),
+          role: "user",
+          sessionID: input.sessionID,
+          time: { created: continueTime },
+          agent: input.agent,
+          model: input.model,
+        })
+        yield* session.updatePart({
+          id: PartID.make(Identifier.create("part", false, continueTime)),
+          messageID: continueMsg.id,
+          sessionID: input.sessionID,
+          type: "text",
+          synthetic: true,
+          text: continuationWithSession(input.sessionID) + fileReminder,
+          time: { start: continueTime, end: continueTime },
         })
 
         log.info("merge complete", {

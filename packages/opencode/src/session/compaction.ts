@@ -15,10 +15,21 @@ import { Plugin } from "@/plugin"
 import { Config } from "@/config/config"
 import { NotFoundError } from "@/storage/db"
 import { ModelID, ProviderID } from "@/provider/schema"
-import { Effect, Layer, Context } from "effect"
+import { Effect, Layer, ServiceMap } from "effect"
 import { makeRuntime } from "@/effect/run-service"
 import { InstanceState } from "@/effect/instance-state"
 import { isOverflow as overflow } from "./overflow"
+import {
+  stripSummaryMeta,
+  CONTINUATION_PROMPT,
+  extractRecentFiles,
+  formatFileReminders,
+  truncateToTokens,
+  REATTACH_LIMITS,
+  continuationWithSession,
+} from "./compaction-prompt"
+import { ToolExtraction } from "./tool-extraction"
+import { TieredCompaction } from "./tiered-compaction"
 
 export namespace SessionCompaction {
   const log = Log.create({ service: "session.compaction" })
@@ -35,6 +46,9 @@ export namespace SessionCompaction {
   export const PRUNE_MINIMUM = 20_000
   export const PRUNE_PROTECT = 40_000
   const PRUNE_PROTECTED_TOOLS = ["skill"]
+  const IDLE_THRESHOLD_MS = 60 * 60_000
+  const IDLE_PRESSURE_FLOOR = PRUNE_PROTECT * 0.5
+  const STALEABLE_TOOLS = new Set(["read", "bash", "grep", "glob", "list", "write", "edit", "multiedit"])
 
   export interface Interface {
     readonly isOverflow: (input: {
@@ -58,7 +72,7 @@ export namespace SessionCompaction {
     }) => Effect.Effect<void>
   }
 
-  export class Service extends Context.Service<Service, Interface>()("@opencode/SessionCompaction") {}
+  export class Service extends ServiceMap.Service<Service, Interface>()("@opencode/SessionCompaction") {}
 
   export const layer: Layer.Layer<
     Service,
@@ -70,6 +84,7 @@ export namespace SessionCompaction {
     | Plugin.Service
     | SessionProcessor.Service
     | Provider.Service
+    | TieredCompaction.Service
   > = Layer.effect(
     Service,
     Effect.gen(function* () {
@@ -80,6 +95,7 @@ export namespace SessionCompaction {
       const plugin = yield* Plugin.Service
       const processors = yield* SessionProcessor.Service
       const provider = yield* Provider.Service
+      const tiered = yield* TieredCompaction.Service
 
       const isOverflow = Effect.fn("SessionCompaction.isOverflow")(function* (input: {
         tokens: MessageV2.Assistant["tokens"]
@@ -89,7 +105,9 @@ export namespace SessionCompaction {
       })
 
       // goes backwards through parts until there are PRUNE_PROTECT tokens worth of tool
-      // calls, then erases output of older tool calls to free context space
+      // calls, then erases output of older tool calls to free context space.
+      // For outputs above the Sieve threshold, enqueues for LLM extraction instead
+      // of just marking as compacted (P4: Prune-Sieve integration).
       const prune = Effect.fn("SessionCompaction.prune")(function* (input: { sessionID: SessionID }) {
         const cfg = yield* config.get()
         if (cfg.compaction?.prune === false) return
@@ -100,9 +118,25 @@ export namespace SessionCompaction {
           .pipe(Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed(undefined)))
         if (!msgs) return
 
+        const extractThreshold = cfg.compaction?.extract_threshold ?? 5_000
+        const idleMs = (cfg.compaction?.idle_threshold_minutes ?? 60) * 60_000
+
+        // P7: Detect idle session. Only activates when:
+        // 1) Last assistant message is older than idle threshold (prompt cache expired)
+        // 2) Context has enough tool output to justify clearing (> IDLE_PRESSURE_FLOOR)
+        // When idle, only staleable tool outputs (read, bash, grep, etc.) are
+        // cleared — analysis/skill results are preserved regardless of age.
+        const lastAssistant = msgs.findLast((m) => m.info.role === "assistant")
+        const isIdle = lastAssistant
+          ? Date.now() - (lastAssistant.info as MessageV2.Assistant).time.created > idleMs
+          : false
+
         let total = 0
         let pruned = 0
+        let idleTotal = 0
+        let idlePruned = 0
         const toPrune: MessageV2.ToolPart[] = []
+        const toExtract: MessageV2.ToolPart[] = []
         let turns = 0
 
         loop: for (let msgIndex = msgs.length - 1; msgIndex >= 0; msgIndex--) {
@@ -120,13 +154,55 @@ export namespace SessionCompaction {
                 total += estimate
                 if (total > PRUNE_PROTECT) {
                   pruned += estimate
-                  toPrune.push(part)
+                  if (ToolExtraction.shouldExtract(part, extractThreshold)) {
+                    toExtract.push(part)
+                  } else {
+                    toPrune.push(part)
+                  }
+                }
+                // Track idle-eligible tokens separately
+                if (isIdle && STALEABLE_TOOLS.has(part.tool)) {
+                  idleTotal += estimate
+                  if (!part.state.time.compacted) idlePruned += estimate
                 }
               }
           }
         }
 
-        log.info("found", { pruned, total })
+        // P7: When idle AND context is pressured, clear staleable tools aggressively
+        const idleActive = isIdle && idleTotal > IDLE_PRESSURE_FLOOR
+        if (idleActive) {
+          for (let msgIndex = msgs.length - 1; msgIndex >= 0; msgIndex--) {
+            const msg = msgs[msgIndex]
+            if (msg.info.role === "assistant" && msg.info.summary) break
+            for (const part of msg.parts) {
+              if (
+                part.type === "tool" &&
+                part.state.status === "completed" &&
+                STALEABLE_TOOLS.has(part.tool) &&
+                !part.state.time.compacted &&
+                !toPrune.includes(part) &&
+                !toExtract.includes(part)
+              ) {
+                if (ToolExtraction.shouldExtract(part, extractThreshold)) {
+                  toExtract.push(part)
+                } else {
+                  toPrune.push(part)
+                  pruned += Token.estimate(part.state.output)
+                }
+              }
+            }
+          }
+        }
+
+        log.info("found", { pruned, total, extract: toExtract.length, compact: toPrune.length, isIdle, idleActive })
+        for (const part of toExtract) {
+          if (part.state.status === "completed") {
+            yield* tiered
+              .enqueue({ sessionID: input.sessionID, part, estimate: Token.estimate(part.state.output) })
+              .pipe(Effect.catch(() => Effect.void))
+          }
+        }
         if (pruned > PRUNE_MINIMUM) {
           for (const part of toPrune) {
             if (part.state.status === "completed") {
@@ -186,13 +262,18 @@ export namespace SessionCompaction {
           { sessionID: input.sessionID },
           { context: [], prompt: undefined },
         )
-        const defaultPrompt = `Provide a detailed prompt for continuing our conversation above.
-Focus on information that would be helpful for continuing the conversation, including what we did, what we're doing, which files we're working on, and what we're going to do next.
-The summary that you construct will be used so that another agent can read it and continue the work.
-Do not call any tools. Respond only with the summary text.
-Respond in the same language as the user's messages in the conversation.
+        const defaultPrompt = `CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
+- Do NOT use Read, Bash, Grep, Glob, Edit, Write, or ANY other tool.
+- You already have all the context you need.
+- Tool calls will be REJECTED and will waste your only turn.
+- Your entire response must be plain text: an <analysis> block followed by a <summary> block.
 
-When constructing the summary, try to stick to this template:
+Provide a detailed summary of the conversation above for continuing the work.
+The summary that you construct will be used so that another agent can read it and continue the work.
+
+First, write an <analysis> block where you chronologically analyze each section of the conversation. Identify the user's requests, your approach, key decisions, code details, errors encountered, and user feedback. Double-check for technical accuracy and completeness.
+
+Then, write a <summary> block following this template:
 ---
 ## Goal
 
@@ -209,12 +290,16 @@ When constructing the summary, try to stick to this template:
 
 ## Accomplished
 
-[What work has been completed, what work is still in progress, and what work is left?]
+[What work has been completed, what work is still in progress, and what is left?]
 
 ## Relevant files / directories
 
 [Construct a structured list of relevant files that have been read, edited, or created that pertain to the task at hand. If all the files in a directory are relevant, include the path to the directory.]
----`
+---
+
+Respond in the same language as the user's messages in the conversation.
+
+Remember: respond with <analysis> then <summary> tags only. No tool calls.`
 
         const prompt = compacting.prompt ?? [defaultPrompt, ...compacting.context].join("\n\n")
         const msgs = structuredClone(messages)
@@ -253,21 +338,23 @@ When constructing the summary, try to stick to this template:
           sessionID: input.sessionID,
           model,
         })
-        const result = yield* processor.process({
-          user: userMessage,
-          agent,
-          sessionID: input.sessionID,
-          tools: {},
-          system: [],
-          messages: [
-            ...modelMessages,
-            {
-              role: "user",
-              content: [{ type: "text", text: prompt }],
-            },
-          ],
-          model,
-        })
+        const result = yield* processor
+          .process({
+            user: userMessage,
+            agent,
+            sessionID: input.sessionID,
+            tools: {},
+            system: [],
+            messages: [
+              ...modelMessages,
+              {
+                role: "user",
+                content: [{ type: "text", text: prompt }],
+              },
+            ],
+            model,
+          })
+          .pipe(Effect.onInterrupt(() => processor.abort()))
 
         if (result === "compact") {
           processor.message.error = new MessageV2.ContextOverflowError({
@@ -293,6 +380,7 @@ When constructing the summary, try to stick to this template:
               format: original.format,
               tools: original.tools,
               system: original.system,
+              variant: original.model.variant,
             })
             for (const part of replay.parts) {
               if (part.type === "compaction") continue
@@ -310,6 +398,28 @@ When constructing the summary, try to stick to this template:
           }
 
           if (!replay) {
+            // P5: Collect recently referenced files for re-attachment
+            const filePaths = extractRecentFiles(messages)
+            let fileReminder = ""
+            if (filePaths.length > 0) {
+              const entries: { path: string; content: string }[] = []
+              let totalTokens = 0
+              for (const fp of filePaths) {
+                if (totalTokens >= REATTACH_LIMITS.maxTotal) break
+                const raw = yield* Effect.tryPromise({
+                  try: () => Bun.file(fp).text(),
+                  catch: () => new Error("file read failed"),
+                }).pipe(Effect.catch(() => Effect.succeed(null as string | null)))
+                if (!raw) continue
+                const capped = truncateToTokens(raw, REATTACH_LIMITS.maxPerFile)
+                const tokens = Math.ceil(capped.length / 4)
+                if (totalTokens + tokens > REATTACH_LIMITS.maxTotal) break
+                entries.push({ path: fp, content: capped })
+                totalTokens += tokens
+              }
+              fileReminder = formatFileReminders(entries)
+            }
+
             const continueMsg = yield* session.updateMessage({
               id: MessageID.ascending(),
               role: "user",
@@ -322,7 +432,8 @@ When constructing the summary, try to stick to this template:
               (input.overflow
                 ? "The previous request exceeded the provider's size limit due to large media attachments. The conversation was compacted and media files were removed from context. If the user was asking about attached images or files, explain that the attachments were too large to process and suggest they try again with smaller or fewer files.\n\n"
                 : "") +
-              "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed."
+              continuationWithSession(input.sessionID) +
+              fileReminder
             yield* session.updatePart({
               id: PartID.ascending(),
               messageID: continueMsg.id,
@@ -339,6 +450,26 @@ When constructing the summary, try to stick to this template:
         }
 
         if (processor.message.error) return "stop"
+
+        // Strip <analysis>/<thinking> blocks from summary text parts
+        const allMsgs = yield* session
+          .messages({ sessionID: input.sessionID })
+          .pipe(Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed([])))
+        const summaryMsg = allMsgs.find(
+          (m) => m.info.role === "assistant" && m.info.summary && m.info.id === processor.message.id,
+        )
+        if (summaryMsg) {
+          for (const part of summaryMsg.parts) {
+            if (part.type === "text" && part.text) {
+              const stripped = stripSummaryMeta(part.text)
+              if (stripped !== part.text) {
+                part.text = stripped
+                yield* session.updatePart(part)
+              }
+            }
+          }
+        }
+
         if (result === "continue") yield* bus.publish(Event.Compacted, { sessionID: input.sessionID })
         return result
       })
@@ -377,15 +508,18 @@ When constructing the summary, try to stick to this template:
     }),
   )
 
-  export const defaultLayer = Layer.suspend(() =>
-    layer.pipe(
-      Layer.provide(Provider.defaultLayer),
-      Layer.provide(Session.defaultLayer),
-      Layer.provide(SessionProcessor.defaultLayer),
-      Layer.provide(Agent.defaultLayer),
-      Layer.provide(Plugin.defaultLayer),
-      Layer.provide(Bus.layer),
-      Layer.provide(Config.defaultLayer),
+  export const defaultLayer = Layer.unwrap(
+    Effect.sync(() =>
+      layer.pipe(
+        Layer.provide(Provider.defaultLayer),
+        Layer.provide(Session.defaultLayer),
+        Layer.provide(SessionProcessor.defaultLayer),
+        Layer.provide(Agent.defaultLayer),
+        Layer.provide(Plugin.defaultLayer),
+        Layer.provide(Bus.layer),
+        Layer.provide(Config.defaultLayer),
+        Layer.provide(TieredCompaction.defaultLayer),
+      ),
     ),
   )
 
@@ -398,6 +532,17 @@ When constructing the summary, try to stick to this template:
   export async function prune(input: { sessionID: SessionID }) {
     return runPromise((svc) => svc.prune(input))
   }
+
+  export const process = fn(
+    z.object({
+      parentID: MessageID.zod,
+      messages: z.custom<MessageV2.WithParts[]>(),
+      sessionID: SessionID.zod,
+      auto: z.boolean(),
+      overflow: z.boolean().optional(),
+    }),
+    (input) => runPromise((svc) => svc.process(input)),
+  )
 
   export const create = fn(
     z.object({

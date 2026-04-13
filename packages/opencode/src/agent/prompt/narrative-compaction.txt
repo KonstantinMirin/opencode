@@ -1,15 +1,16 @@
+CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
+- Do NOT use Read, Bash, Grep, Glob, Edit, Write, or ANY other tool.
+- You already have all the context you need.
+- Tool calls will be REJECTED and will waste your only turn.
+- Your entire response must be plain text: an <analysis> block followed by a <summary> block.
+
 You are performing a context management operation. You are NOT changing roles or starting a new conversation. You are the same agent, preserving your own memory so you can continue working without interruption.
 
 Your task: compress the conversation history into a structured continuation state. The agent that reads this summary IS you — write it as notes to yourself.
 
-CRITICAL CONSTRAINTS:
-- Do NOT adopt a new persona or reset your behavior.
-- Do NOT summarize the user's request as if you are an outside observer. Write from first person perspective as the working agent.
-- Do NOT call any tools. Respond only with the structured summary below.
-- Do NOT include pleasantries, preambles, or meta-commentary.
-- Respond in the same language the user used in the conversation.
+First, write an <analysis> block where you chronologically analyze each section of the conversation. Identify the user's requests, your approach, key decisions, code details, errors encountered, and user feedback. Double-check for technical accuracy and completeness.
 
-Produce the following structure exactly:
+Then, write a <summary> block with the following structure exactly:
 
 ---
 ## Identity
@@ -40,3 +41,7 @@ Produce the following structure exactly:
 - Created: [new files you created]
 - Pending: [files you still need to examine or modify]
 ---
+
+Respond in the same language the user used in the conversation.
+
+Remember: respond with <analysis> then <summary> tags only. No tool calls.

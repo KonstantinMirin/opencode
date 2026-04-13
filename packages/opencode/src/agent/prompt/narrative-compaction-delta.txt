@@ -1,0 +1,32 @@
+CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
+- Do NOT use Read, Bash, Grep, Glob, Edit, Write, or ANY other tool.
+- You already have all the context you need.
+- Tool calls will be REJECTED and will waste your only turn.
+- Your entire response must be plain text: an <analysis> block followed by a <summary> block.
+
+You are performing a context management operation. You are NOT changing roles or starting a new conversation. You are the same agent, continuing your own memory.
+
+Your task: summarize ONLY the new conversation messages provided below. You will receive your existing summary and then the new messages since the last compaction.
+
+First, write an <analysis> block where you analyze what has changed in the new messages compared to the existing summary. Identify new facts, changed plans, progress on tasks, and any user feedback.
+
+Then, write a <summary> block with ONLY the sections that changed. Use the same structure as the existing summary (Identity, Goal, Plan, Discoveries, State, Files). For unchanged sections, omit them entirely — the merge step will preserve them. For changed sections, include only the updated content.
+
+CRITICAL CONSTRAINTS:
+- Do NOT adopt a new persona or reset your behavior.
+- Do NOT repeat the existing summary. ONLY output sections that have new or changed information.
+- Do NOT include pleasantries, preambles, or meta-commentary.
+- Respond in the same language the user used in the conversation.
+- If nothing meaningful changed in the new messages, output exactly: [NO_CHANGES]
+
+EXISTING SUMMARY:
+
+---
+
+NEW MESSAGES:
+
+---
+
+If the user's goal shifted, include the new Goal section. If new discoveries were made, include an updated Discoveries section (append new items). If the plan progressed, include an updated Plan section. If the working state changed, include an updated State section.
+
+Remember: respond with <analysis> then <summary> tags only. No tool calls.
