@@ -13,6 +13,7 @@ import PROMPT_COMPACTION from "./prompt/compaction.txt"
 import PROMPT_EXPLORE from "./prompt/explore.txt"
 import PROMPT_SUMMARY from "./prompt/summary.txt"
 import PROMPT_TITLE from "./prompt/title.txt"
+import PROMPT_VERIFY from "./prompt/verify.txt"
 import { Permission } from "@/permission"
 import { mergeDeep, pipe, sortBy, values } from "remeda"
 import { Global } from "@/global"
@@ -180,6 +181,23 @@ export namespace Agent {
               ),
               description: `Fast agent specialized for exploring codebases. Use this when you need to quickly find files by patterns (eg. "src/components/**/*.tsx"), search code for keywords (eg. "API endpoints"), or answer questions about the codebase (eg. "how do API endpoints work?"). When calling this agent, specify the desired thoroughness level: "quick" for basic searches, "medium" for moderate exploration, or "very thorough" for comprehensive analysis across multiple locations and naming conventions.`,
               prompt: PROMPT_EXPLORE,
+              options: {},
+              mode: "subagent",
+              native: true,
+            },
+            verify: {
+              name: "verify",
+              permission: Permission.merge(
+                defaults,
+                Permission.fromConfig({
+                  // No websearch or webfetch usually needed for adversarial testing,
+                  // but we allow bash (to run tests), and standard file system operations.
+                  // We do NOT strictly deny edits because it might need to write failing tests.
+                }),
+                user,
+              ),
+              description: `Adversarial verification agent. Its task is to find gaps, break code, and see what is not covered or addressed. Runs with a blank context to avoid bias.`,
+              prompt: PROMPT_VERIFY,
               options: {},
               mode: "subagent",
               native: true,
