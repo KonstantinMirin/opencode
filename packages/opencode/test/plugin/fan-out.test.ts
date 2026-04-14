@@ -8,6 +8,11 @@ import { Server } from "../../src/server/server"
 import { Session } from "../../src/session"
 import { Log } from "../../src/util/log"
 import { tmpdir } from "../fixture/fixture"
+import { Database } from "../../src/storage/db"
+import { MessageTable, PartTable } from "../../src/session/session.sql"
+import { MessageID } from "../../src/session/schema"
+import { PartID } from "../../src/session/schema"
+import { Identifier } from "../../src/id/id"
 
 Log.init({ print: false })
 
@@ -84,8 +89,63 @@ async function getTeams() {
   return (mod as any)._teams as Map<string, any>
 }
 
+function nextMessageID(): string {
+  return Identifier.ascending("message")
+}
+
+function nextPartID(): string {
+  return Identifier.ascending("part")
+}
+
+function insertAssistantMessage(sessionID: string, text: string) {
+  const msgID = nextMessageID()
+  const partID = nextPartID()
+  const now = Date.now()
+
+  Database.use((db) => {
+    db.insert(MessageTable)
+      .values({
+        id: msgID as any,
+        session_id: sessionID as any,
+        time_created: now,
+        data: {
+          role: "assistant",
+          parentID: nextMessageID(),
+          modelID: "test-model",
+          providerID: "test-provider",
+          mode: "build",
+          agent: "build",
+          path: { cwd: "/tmp", root: "/tmp" },
+          cost: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+          time: { created: now, completed: now },
+        },
+      })
+      .run()
+
+    db.insert(PartTable)
+      .values({
+        id: partID as any,
+        message_id: msgID as any,
+        session_id: sessionID as any,
+        time_created: now,
+        data: { type: "text", text },
+      })
+      .run()
+  })
+}
+
+async function emitStatus(hooks: any, sessionID: string, status: { type: string }) {
+  await hooks.event({
+    event: {
+      type: "session.status",
+      properties: { sessionID, status },
+    },
+  })
+}
+
 // ──────────────────────────────────────────────────────────────
-// Gap 4: SDK response shape — confirm {data, error, response}
+// SDK response shape — confirm {data, error, response}
 // ──────────────────────────────────────────────────────────────
 
 describe("fan-out: SDK response shape", () => {
@@ -150,16 +210,7 @@ describe("fan-out: SDK response shape", () => {
 })
 
 // ──────────────────────────────────────────────────────────────
-// Gap 1: Recovery — verify DB preserves workspace linkage
-// ──────────────────────────────────────────────────────────────
-
-// NOTE: Recovery test requires full app runtime (Config service).
-// The session.children + workspaceID fields are verified in the SDK shape tests.
-// Full recovery e2e should be tested manually or with the Effect-based test infrastructure.
-
-// ──────────────────────────────────────────────────────────────
 // Plugin tool + hook tests
-// Each test is self-contained (setup → act → assert)
 // ──────────────────────────────────────────────────────────────
 
 describe("fan-out: spawn and lifecycle", () => {
@@ -359,8 +410,7 @@ describe("fan-out: hooks", () => {
 })
 
 // ──────────────────────────────────────────────────────────────
-// Gap: Recovery on Restart
-// Tests lazy rehydration from DB + orphan GC
+// Recovery — verify DB preserves workspace linkage
 // ──────────────────────────────────────────────────────────────
 
 describe("fan-out: recovery", () => {
@@ -449,8 +499,7 @@ describe("fan-out: recovery", () => {
 })
 
 // ──────────────────────────────────────────────────────────────
-// Gap: merge_worker git flow
-// Tests clean merge, conflicts, dirty worktree, busy reject
+// Git: merge_worker flow
 // ──────────────────────────────────────────────────────────────
 
 describe("fan-out: merge_worker", () => {
@@ -466,7 +515,7 @@ describe("fan-out: merge_worker", () => {
   }
 
   async function spawnIdleWorker(hooks: any, leadID: string, desc: string) {
-    const spawn = await hooks.tool.spawn_workers.execute(
+    await hooks.tool.spawn_workers.execute(
       { tasks: [{ description: desc, prompt: "do it", agent: "build" }] },
       toolCtx(leadID),
     )
@@ -483,9 +532,6 @@ describe("fan-out: merge_worker", () => {
       await Bun.$.cwd(dir)`git commit -m "add base.txt"`.quiet()
 
       const worker = await spawnIdleWorker(hooks, lead.id, "merge-clean")
-
-      const st = await Bun.$.cwd(dir)`git status`.quiet()
-      console.log("git status after spawn:", st.text())
 
       await Bun.write(path.join(worker.directory, "new-feature.txt"), "worker-content")
       execSync(`git add new-feature.txt`, { cwd: worker.directory })
@@ -586,13 +632,34 @@ describe("fan-out: merge_worker", () => {
 })
 
 // ──────────────────────────────────────────────────────────────
-// Gap: session.status polling
-// Tests SDK status sync, self-healing queue flush, fallback
+// E2E: Verification Pipeline (Ping-Pong)
 // ──────────────────────────────────────────────────────────────
 
-describe("fan-out: pipeline verification", () => {
-  test("worker spawns verifier on completion and passes when APPROVED", async () => {
-    await setup(async ({ url, dir, v2 }) => {
+describe("fan-out: pipeline verification (e2e)", () => {
+  test("no verify_agent: builder goes idle, no verifier spawns", async () => {
+    await setup(async ({ url, dir }) => {
+      const { hooks } = await loadPlugin(url, dir)
+      const lead = await Session.create({ title: "lead" })
+
+      await hooks.tool.spawn_workers.execute(
+        { tasks: [{ description: "plain-task", prompt: "do it", agent: "build" }] },
+        toolCtx(lead.id),
+      )
+
+      const teams = await getTeams()
+      const worker = [...teams.get(lead.id).workers.values()][0]
+      worker.status = { type: "busy" }
+
+      await emitStatus(hooks, worker.sessionID, { type: "idle" })
+
+      expect(worker.status.type).toBe("idle")
+      expect(worker.isVerifying).toBe(false)
+      expect(worker.verifySessionID).toBeUndefined()
+    })
+  })
+
+  test("builder → verifier → APPROVED: pipeline completes", async () => {
+    await setup(async ({ url, dir }) => {
       const { hooks } = await loadPlugin(url, dir)
       const lead = await Session.create({ title: "lead" })
 
@@ -603,29 +670,31 @@ describe("fan-out: pipeline verification", () => {
 
       const teams = await getTeams()
       const worker = [...teams.get(lead.id).workers.values()][0]
+      worker.status = { type: "busy" }
 
-      // Simulate build finishing
-      await hooks.event({
-        event: {
-          type: "session.status",
-          properties: { sessionID: worker.sessionID, status: { type: "idle" } },
-        } as any,
-      })
+      // Builder finishes → triggers verifier spawn
+      await emitStatus(hooks, worker.sessionID, { type: "idle" })
 
-      // Check that verifier was spawned
       expect(worker.isVerifying).toBe(true)
       expect(worker.verifySessionID).toBeDefined()
-      expect(worker.status.type).toBe("busy") // main agent sees it as busy
+      expect(worker.status.type).toBe("busy") // hidden from main agent
 
-      // Force mock the state for testing since promptAsync in tests doesn't trigger full DB persistence correctly
-      worker.isVerifying = false
-      worker.verifySessionID = undefined
-      worker.status = { type: "idle" }
+      // Simulate verifier LLM producing an APPROVED response in the DB
+      insertAssistantMessage(worker.verifySessionID!, "All checks pass. [APPROVED]")
+
+      // Verifier finishes
+      await emitStatus(hooks, worker.verifySessionID!, { type: "idle" })
+
+      // Pipeline should complete
+      expect(worker.isVerifying).toBe(false)
+      expect(worker.verifySessionID).toBeUndefined()
+      expect(worker.verifyRetries).toBe(0)
+      expect(worker.status.type).toBe("idle")
     })
   })
 
-  test("worker bounces back to builder when REJECTED", async () => {
-    await setup(async ({ url, dir, v2 }) => {
+  test("builder → verifier → REJECTED: bounces back to builder", async () => {
+    await setup(async ({ url, dir }) => {
       const { hooks } = await loadPlugin(url, dir)
       const lead = await Session.create({ title: "lead" })
 
@@ -636,114 +705,147 @@ describe("fan-out: pipeline verification", () => {
 
       const teams = await getTeams()
       const worker = [...teams.get(lead.id).workers.values()][0]
+      worker.status = { type: "busy" }
 
-      // Build finishes
-      await hooks.event({
-        event: {
-          type: "session.status",
-          properties: { sessionID: worker.sessionID, status: { type: "idle" } },
-        } as any,
-      })
+      // Builder finishes
+      await emitStatus(hooks, worker.sessionID, { type: "idle" })
+      expect(worker.isVerifying).toBe(true)
 
       const vId1 = worker.verifySessionID!
 
-      // Force mock the state
-      worker.isVerifying = false
-      worker.verifyRetries = 1
-      worker.status = { type: "busy" }
+      // Verifier rejects
+      insertAssistantMessage(vId1, "Missing input validation! [REJECTED]")
 
-      // Worker should bounce back to busy, verifying false
+      await emitStatus(hooks, vId1, { type: "idle" })
+
+      // Should bounce back to builder
       expect(worker.isVerifying).toBe(false)
       expect(worker.verifyRetries).toBe(1)
       expect(worker.status.type).toBe("busy")
+      expect(worker.verifySessionID).toBeUndefined()
 
       // Builder finishes fixing
-      await hooks.event({
-        event: {
-          type: "session.status",
-          properties: { sessionID: worker.sessionID, status: { type: "idle" } },
-        } as any,
-      })
+      await emitStatus(hooks, worker.sessionID, { type: "idle" })
 
-      // A new verifier should spawn
+      // New verifier should spawn
       expect(worker.isVerifying).toBe(true)
       expect(worker.verifySessionID).toBeDefined()
       expect(worker.verifySessionID).not.toBe(vId1)
     })
   })
 
-  describe("fan-out: session.status polling", () => {
-    test("worker_status syncs worker status from SDK", async () => {
-      await setup(async ({ url, dir, v2 }) => {
-        const { hooks } = await loadPlugin(url, dir)
-        const lead = await Session.create({ title: "lead" })
+  test("max retries (3): pipeline halts with manual intervention message", async () => {
+    await setup(async ({ url, dir }) => {
+      const { hooks } = await loadPlugin(url, dir)
+      const lead = await Session.create({ title: "lead" })
 
-        await hooks.tool.spawn_workers.execute(
-          { tasks: [{ description: "sync-task", prompt: "do it", agent: "build" }] },
-          toolCtx(lead.id),
-        )
+      await hooks.tool.spawn_workers.execute(
+        { tasks: [{ description: "deadlock-task", prompt: "do it", agent: "build", verify_agent: "verify" }] },
+        toolCtx(lead.id),
+      )
 
-        const teams = await getTeams()
-        const worker = [...teams.get(lead.id).workers.values()][0]
-        worker.status = undefined
+      const teams = await getTeams()
+      const worker = [...teams.get(lead.id).workers.values()][0]
+      worker.status = { type: "busy" }
 
-        const status = await hooks.tool.worker_status.execute({}, toolCtx(lead.id))
-        expect(status).toContain("sync-task")
+      // Cycle 1: Builder finishes → Verifier rejects
+      await emitStatus(hooks, worker.sessionID, { type: "idle" })
+      insertAssistantMessage(worker.verifySessionID!, "Bad. [REJECTED]")
+      await emitStatus(hooks, worker.verifySessionID!, { type: "idle" })
 
-        const sdkStatus = await v2.session
-          .status()
-          .then((r) => r.data)
-          .catch(() => undefined)
-        if (sdkStatus && sdkStatus[worker.sessionID]) {
-          expect(worker.status).toBeDefined()
-        }
-      })
+      expect(worker.verifyRetries).toBe(1)
+      expect(worker.status.type).toBe("busy")
+
+      // Cycle 2: Builder finishes → Verifier rejects again
+      await emitStatus(hooks, worker.sessionID, { type: "idle" })
+      insertAssistantMessage(worker.verifySessionID!, "Still bad. [REJECTED]")
+      await emitStatus(hooks, worker.verifySessionID!, { type: "idle" })
+
+      expect(worker.verifyRetries).toBe(2)
+      expect(worker.status.type).toBe("busy")
+
+      // Cycle 3: Builder finishes → Verifier rejects a third time
+      await emitStatus(hooks, worker.sessionID, { type: "idle" })
+      insertAssistantMessage(worker.verifySessionID!, "Hopeless. [REJECTED]")
+      await emitStatus(hooks, worker.verifySessionID!, { type: "idle" })
+
+      // Pipeline should halt
+      expect(worker.verifyRetries).toBe(3)
+      expect(worker.isVerifying).toBe(false)
+      expect(worker.verifySessionID).toBeUndefined()
+      expect(worker.status.type).toBe("idle")
+      expect(worker.hasReply).toBe(true)
+      expect(worker.queued.length).toBeGreaterThan(0)
+      expect(worker.queued[0]).toContain("Manual intervention")
     })
+  })
+})
 
-    test("self-healing: poll discovers idle and flushes queued message", async () => {
-      await setup(async ({ url, dir }) => {
-        const { hooks } = await loadPlugin(url, dir)
-        const lead = await Session.create({ title: "lead" })
+// ──────────────────────────────────────────────────────────────
+// E2E: Crash Recovery During Verification Pipeline
+// ──────────────────────────────────────────────────────────────
 
-        await hooks.tool.spawn_workers.execute(
-          { tasks: [{ description: "heal-task", prompt: "do it", agent: "build" }] },
-          toolCtx(lead.id),
-        )
+describe("fan-out: recovery during pipeline", () => {
+  test("survives crash while verifier is running", async () => {
+    await setup(async ({ url, dir }) => {
+      const { hooks } = await loadPlugin(url, dir)
+      const lead = await Session.create({ title: "lead" })
 
-        const teams = await getTeams()
-        const worker = [...teams.get(lead.id).workers.values()][0]
-        // Worker is "busy" from spawn. The SDK likely returns "idle"
-        // (promptAsync failed without LLM). Queue a message.
-        worker.queued.push("follow-up message")
+      await hooks.tool.spawn_workers.execute(
+        { tasks: [{ description: "crash-task", prompt: "do it", agent: "build", verify_agent: "verify" }] },
+        toolCtx(lead.id),
+      )
 
-        await hooks.tool.worker_status.execute({}, toolCtx(lead.id))
+      const teams = await getTeams()
+      const worker = [...teams.get(lead.id).workers.values()][0]
+      worker.status = { type: "busy" }
 
-        const teamsAfter = await getTeams()
-        const teamAfter = teamsAfter.get(lead.id)
-        expect(teamAfter).toBeDefined()
-        const workerAfter = [...teamAfter.workers.values()][0]
-        // If SDK returned idle, self-healing flushed the queue.
-        // If SDK still said busy (unlikely without LLM), queue preserved.
-        if (workerAfter.status?.type !== "busy") {
-          expect(workerAfter.queued.length).toBe(0)
-        }
-      })
+      // Builder finishes → Verifier spawns
+      await emitStatus(hooks, worker.sessionID, { type: "idle" })
+      const originalBranch = worker.branch
+      const originalWorkspaceID = worker.workspaceID
+
+      // Simulate crash: wipe in-memory state
+      teams.clear()
+
+      // Recovery via worker_status
+      const status = await hooks.tool.worker_status.execute({}, toolCtx(lead.id))
+      expect(status).toContain("crash-task")
+
+      // Verify the recovered team has correct metadata
+      const recoveredTeams = await getTeams()
+      const recoveredTeam = recoveredTeams.get(lead.id)
+      expect(recoveredTeam).toBeDefined()
+      const recoveredWorker = [...recoveredTeam.workers.values()][0]
+      expect(recoveredWorker.branch).toBe(originalBranch)
+      expect(recoveredWorker.workspaceID).toBe(originalWorkspaceID)
     })
+  })
 
-    test("worker_status returns in-memory state when SDK is unavailable", async () => {
-      await setup(async ({ url, dir }) => {
-        const { hooks } = await loadPlugin(url, dir)
-        const lead = await Session.create({ title: "lead" })
+  test("orphan worker with workspace removed is garbage collected", async () => {
+    await setup(async ({ url, dir, v2 }) => {
+      const { hooks } = await loadPlugin(url, dir)
+      const lead = await Session.create({ title: "lead" })
 
-        await hooks.tool.spawn_workers.execute(
-          { tasks: [{ description: "fallback-task", prompt: "do it", agent: "build" }] },
-          toolCtx(lead.id),
-        )
+      await hooks.tool.spawn_workers.execute(
+        { tasks: [{ description: "gc-task", prompt: "do it", agent: "build" }] },
+        toolCtx(lead.id),
+      )
 
-        const status = await hooks.tool.worker_status.execute({}, toolCtx(lead.id))
-        expect(status).toContain("fallback-task")
-        expect(typeof status).toBe("string")
-      })
+      const teams = await getTeams()
+      const team = teams.get(lead.id)
+      const workspaceID = [...team.workers.values()][0].workspaceID
+
+      // Remove workspace behind plugin's back
+      await v2.experimental.workspace.remove({ id: workspaceID }).catch(() => {})
+
+      // Simulate crash
+      teams.clear()
+
+      // Recovery should GC the orphan
+      const status = await hooks.tool.worker_status.execute({}, toolCtx(lead.id))
+      expect(status).toContain("No active workers")
+      expect(teams.has(lead.id)).toBe(false)
     })
   })
 })

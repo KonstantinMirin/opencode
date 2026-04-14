@@ -472,21 +472,11 @@ const FanOutPlugin: Plugin = async (input: PluginInput) => {
       // Show changed files
       let diff: string
       try {
-        const pwd = await input.$`pwd`.quiet()
-        console.log("pwd inside merge_worker:", pwd.text().trim())
-        console.log("process.cwd():", process.cwd())
-        console.log("input.directory:", input.directory)
-        const st = await input.$`git status`.quiet()
-        console.log("git status:", st.text())
-
         const baseBranch = await input.$`git branch --show-current`.quiet()
         const base = baseBranch.text().trim() || "HEAD"
-        console.log(`Plugin executing: git diff --name-only ${base}..${worker.branch}`)
         const result = await input.$`git diff --name-only ${base}..${worker.branch}`.quiet()
         diff = result.text()
-        console.log(`Plugin diff output: '${diff}'`)
-      } catch (err) {
-        console.log("Plugin diff failed:", err)
+      } catch {
         diff = "(could not diff)"
       }
 
