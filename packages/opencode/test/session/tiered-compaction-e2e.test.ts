@@ -115,18 +115,8 @@ function fakeProcessor() {
       create: Effect.fn("TestSessionProcessor.create")((input) =>
         Effect.succeed({
           message: input.assistantMessage,
-          partFromToolCall() {
-            return {
-              id: PartID.ascending(),
-              messageID: input.assistantMessage.id,
-              sessionID: input.assistantMessage.sessionID,
-              type: "tool" as const,
-              callID: "fake",
-              tool: "fake",
-              state: { status: "pending" as const, input: {}, raw: "" },
-            }
-          },
-          abort: Effect.fn("TestSessionProcessor.abort")(() => Effect.void),
+          updateToolCall: Effect.fn("TestSessionProcessor.updateToolCall")(() => Effect.succeed(undefined)),
+          completeToolCall: Effect.fn("TestSessionProcessor.completeToolCall")(() => Effect.void),
           process: Effect.fn("TestSessionProcessor.process")(() => Effect.succeed("continue" as const)),
         }),
       ),

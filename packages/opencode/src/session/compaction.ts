@@ -354,7 +354,7 @@ Remember: respond with <analysis> then <summary> tags only. No tool calls.`
             ],
             model,
           })
-          .pipe(Effect.onInterrupt(() => processor.abort()))
+          
 
         if (result === "compact") {
           processor.message.error = new MessageV2.ContextOverflowError({

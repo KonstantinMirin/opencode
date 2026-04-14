@@ -1707,7 +1707,7 @@ export namespace Config {
       }),
     )
 
-  export const defaultLayer = layer.pipe(
+  export const defaultLayer: Layer.Layer<Service> = layer.pipe(
     Layer.provide(AppFileSystem.defaultLayer),
     Layer.provide(Auth.defaultLayer),
     Layer.provide(Account.defaultLayer),

@@ -34,8 +34,8 @@ import * as CrossSpawnSpawner from "@/effect/cross-spawn-spawner"
 import * as Stream from "effect/Stream"
 import { Command } from "../command"
 import { pathToFileURL, fileURLToPath } from "url"
-import { ConfigMarkdown } from "../config/markdown"
-import { Config } from "../config/config"
+import { ConfigMarkdown } from "@/config/markdown"
+import { Config } from "@/config/config"
 import { SessionSummary } from "./summary"
 import { NamedError } from "@opencode-ai/util/error"
 import { SessionProcessor } from "./processor"
@@ -1734,8 +1734,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
     }),
   )
 
-  export const defaultLayer = Layer.suspend(() =>
-    layer.pipe(
+  export const defaultLayer: Layer.Layer<Service> = Layer.suspend(() => {
+    const p1 = layer.pipe(
       Layer.provide(SessionRunState.defaultLayer),
       Layer.provide(SessionStatus.defaultLayer),
       Layer.provide(SessionCompaction.defaultLayer),
@@ -1746,6 +1746,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       Layer.provide(MCP.defaultLayer),
       Layer.provide(LSP.defaultLayer),
       Layer.provide(FileTime.defaultLayer),
+    )
+    return p1.pipe(
       Layer.provide(ToolRegistry.defaultLayer),
       Layer.provide(Truncate.defaultLayer),
       Layer.provide(Provider.defaultLayer),
@@ -1755,6 +1757,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       Layer.provide(Session.defaultLayer),
       Layer.provide(SessionRevert.defaultLayer),
       Layer.provide(SessionSummary.defaultLayer),
+      Layer.provide(Config.defaultLayer),
       Layer.provide(
         Layer.mergeAll(
           Agent.defaultLayer,
@@ -1764,8 +1767,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           CrossSpawnSpawner.defaultLayer,
         ),
       ),
-    ),
-  )
+    )
+  })
   const { runPromise } = makeRuntime(Service, defaultLayer)
 
   export const PromptInput = z.object({

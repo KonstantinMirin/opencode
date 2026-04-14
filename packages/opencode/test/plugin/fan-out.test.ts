@@ -105,8 +105,8 @@ function insertAssistantMessage(sessionID: string, text: string) {
   Database.use((db) => {
     db.insert(MessageTable)
       .values({
-        id: msgID as any,
-        session_id: sessionID as any,
+        id: msgID,
+        session_id: sessionID,
         time_created: now,
         data: {
           role: "assistant",
@@ -120,17 +120,17 @@ function insertAssistantMessage(sessionID: string, text: string) {
           tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
           time: { created: now, completed: now },
         },
-      })
+      } as any)
       .run()
 
     db.insert(PartTable)
       .values({
-        id: partID as any,
-        message_id: msgID as any,
-        session_id: sessionID as any,
+        id: partID,
+        message_id: msgID,
+        session_id: sessionID,
         time_created: now,
         data: { type: "text", text },
-      })
+      } as any)
       .run()
   })
 }
