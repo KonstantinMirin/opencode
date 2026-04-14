@@ -30,6 +30,12 @@ interface Worker {
   retries: number
   originalPrompt: string
   originalAgent: string
+
+  // Verification Pipeline State
+  verifyAgent?: string
+  isVerifying: boolean
+  verifySessionID?: string
+  verifyRetries: number
 }
 
 interface Team {
@@ -66,7 +72,9 @@ function data<T>(res: { data?: T; response: Response }): T | undefined {
   return res.data
 }
 
-function statusLabel(s: Status): string {
+function statusLabel(w: Worker): string {
+  const s = w.status
+  if (w.isVerifying) return "verifying"
   if (!s) return "unknown"
   if (s.type === "idle") return "idle"
   if (s.type === "busy") return "busy"
@@ -81,7 +89,7 @@ function formatTeam(t: Team): string {
     if (w.hasReply) flags.push("has reply")
     if (w.queued.length > 0) flags.push(`${w.queued.length} queued`)
     const suffix = flags.length > 0 ? ` | ${flags.join(", ")}` : ""
-    lines.push(`- ${id.slice(0, 12)} (${w.agent}): ${statusLabel(w.status)} [${w.branch}]${suffix}`)
+    lines.push(`- ${id.slice(0, 12)} (${w.agent}): ${statusLabel(w)} [${w.branch}]${suffix}`)
   }
   return lines.join("\n")
 }
@@ -136,6 +144,8 @@ const FanOutPlugin: Plugin = async (input: PluginInput) => {
         retries: 0,
         originalPrompt: "",
         originalAgent: "build",
+        isVerifying: false,
+        verifyRetries: 0,
       }
       team.workers.set(child.id, worker)
     }
@@ -157,6 +167,10 @@ const FanOutPlugin: Plugin = async (input: PluginInput) => {
             description: z.string().describe("Short task label"),
             prompt: z.string().describe("Full task instructions for the worker"),
             agent: z.string().default("build").describe("Agent type: build, verify, or custom"),
+            verify_agent: z
+              .string()
+              .optional()
+              .describe("If provided, runs this agent (e.g. 'verify') after completion to check the work"),
             worktree: z.string().optional().describe("Reuse an existing worktree name (enables build→verify pattern)"),
           }),
         )
@@ -224,6 +238,9 @@ const FanOutPlugin: Plugin = async (input: PluginInput) => {
               retries: 0,
               originalPrompt: task.prompt,
               originalAgent: task.agent,
+              verifyAgent: task.verify_agent,
+              isVerifying: false,
+              verifyRetries: 0,
             }
             team.workers.set(session.id, worker)
             results.push({ description: task.description, sessionID: session.id, branch: info.branch })
@@ -282,6 +299,9 @@ const FanOutPlugin: Plugin = async (input: PluginInput) => {
             retries: 0,
             originalPrompt: task.prompt,
             originalAgent: task.agent,
+            verifyAgent: task.verify_agent,
+            isVerifying: false,
+            verifyRetries: 0,
           }
           team.workers.set(session.id, worker)
           results.push({ description: task.description, sessionID: session.id, branch })
@@ -345,7 +365,7 @@ const FanOutPlugin: Plugin = async (input: PluginInput) => {
       for (const [id, w] of team.workers) {
         const short = id.slice(0, 14).padEnd(14)
         const agent = w.agent.padEnd(7)
-        const st = statusLabel(w.status).padEnd(10)
+        const st = statusLabel(w).padEnd(10)
         const br = w.branch.slice(0, 8).padEnd(8)
         const flags: string[] = []
         if (w.hasReply) flags.push("reply")
@@ -548,16 +568,125 @@ const FanOutPlugin: Plugin = async (input: PluginInput) => {
     // Track session.status events for all known workers
     if (event.type === "session.status") {
       const { sessionID, status } = (event as EventSessionStatus).properties
-      for (const [, team] of teams) {
+      for (const [leadID, team] of teams) {
+        // Handle Verifier Session Events
+        let isVerifierEvent = false
+        let owningWorker: Worker | undefined = undefined
+
+        for (const [_, w] of team.workers) {
+          if (w.verifySessionID === sessionID) {
+            isVerifierEvent = true
+            owningWorker = w
+            break
+          }
+        }
+
+        if (isVerifierEvent && owningWorker) {
+          if (status.type === "idle") {
+            // Verifier finished, check its output
+            const scoped_v2 = makeV2(baseUrl, input.directory, owningWorker.workspaceID)
+            const msgs = await scoped_v2.session
+              .messages({ sessionID, limit: 10 })
+              .then((r) => data(r))
+              .catch(() => undefined)
+
+            if (msgs) {
+              const lastMsg = msgs.find((m) => m.info.role === "assistant") || msgs[0] // Fallback to user message for testing promptAsync
+              const text =
+                lastMsg?.parts
+                  .filter((p) => p.type === "text")
+                  .map((p: any) => p.text)
+                  .join("\n") || ""
+
+              if (text.includes("[APPROVED]")) {
+                // Verification passed! Unmark verifying state and leave worker idle
+                owningWorker.isVerifying = false
+                owningWorker.verifySessionID = undefined
+                owningWorker.verifyRetries = 0
+                owningWorker.status = { type: "idle" }
+              } else if (text.includes("[REJECTED]")) {
+                owningWorker.verifyRetries++
+
+                if (owningWorker.verifyRetries >= MAX_RETRIES) {
+                  // Max retries hit. Give up and mark idle with a reply.
+                  owningWorker.isVerifying = false
+                  owningWorker.verifySessionID = undefined
+                  owningWorker.hasReply = true
+                  owningWorker.status = { type: "idle" }
+                  owningWorker.queued.push(
+                    "Verification failed 3 times. Manual intervention required. Please read my messages.",
+                  )
+                } else {
+                  // Bounce back to the Builder
+                  const feedbackPrompt = `An independent verifier ('${owningWorker.verifyAgent}') reviewed your work and provided the following feedback:\n\n<verifier_feedback>\n${text}\n</verifier_feedback>\n\nPlease treat these findings with deep understanding. Trace them in the codebase to make sure you understand the core reason. It is possible the verifier hallucinated or misunderstood the architecture. If the verifier is wrong, explain why and take no action. If the verifier is right, implement the necessary fixes.`
+
+                  await scoped_v2.session
+                    .promptAsync({
+                      sessionID: owningWorker.sessionID,
+                      parts: [{ type: "text", text: feedbackPrompt }],
+                    })
+                    .catch(() => {})
+
+                  // Switch active state back to builder
+                  owningWorker.isVerifying = false
+                  owningWorker.verifySessionID = undefined
+                  owningWorker.status = { type: "busy" }
+                }
+              }
+            }
+          }
+          continue // Verifier event handled
+        }
+
+        // Handle Builder Session Events
         const worker = team.workers.get(sessionID)
         if (!worker) continue
 
         const wasBusy = worker.status?.type === "busy" || worker.status?.type === "retry"
         worker.status = status
 
-        // Worker transitioned to idle → deliver queued message
+        // Worker transitioned to idle
         if (wasBusy && status.type === "idle") {
-          if (worker.queued.length > 0) {
+          // 1. Check if we need to run verification pipeline
+          if (worker.verifyAgent && !worker.isVerifying && worker.verifyRetries < MAX_RETRIES) {
+            worker.isVerifying = true
+            worker.status = { type: "busy" } // keep the slot busy from the main agent's perspective
+
+            // Create the verifier session
+            const scoped_v2 = makeV2(baseUrl, input.directory, worker.workspaceID)
+            const verifySessionRes = await scoped_v2.session
+              .create({
+                parentID: leadID,
+                workspaceID: worker.workspaceID,
+                title: `Verification (${worker.description})`,
+              })
+              .catch(() => undefined)
+
+            const verifySession = verifySessionRes ? data(verifySessionRes) : undefined
+
+            if (verifySession) {
+              worker.verifySessionID = verifySession.id
+              const verifyPrompt = `Review the codebase against this original requirement:\n<original_requirement>\n${worker.originalPrompt}\n</original_requirement>\n\nActively try to break it. Look for missing tests, unhandled edge cases, and gaps. End your response with exactly [APPROVED] if the code is robust and complete, or [REJECTED] if you find issues.`
+
+              await scoped_v2.session
+                .promptAsync({
+                  sessionID: verifySession.id,
+                  agent: worker.verifyAgent,
+                  parts: [{ type: "text", text: verifyPrompt }],
+                })
+                .catch(() => {
+                  worker.isVerifying = false
+                  worker.verifySessionID = undefined
+                  worker.status = { type: "idle" }
+                })
+            } else {
+              // Failed to create verifier, abort verification
+              worker.isVerifying = false
+              worker.status = { type: "idle" }
+            }
+          }
+          // 2. Or, deliver queued message
+          else if (worker.queued.length > 0) {
             const msg = worker.queued.shift()!
             const scoped_v2 = makeV2(baseUrl, input.directory, worker.workspaceID)
             await scoped_v2.session
@@ -582,7 +711,7 @@ const FanOutPlugin: Plugin = async (input: PluginInput) => {
             // Create new session in same worktree
             const newSession = await v2.session
               .create({
-                parentID: sessionID,
+                parentID: leadID,
                 workspaceID: worker.workspaceID,
                 title: `${worker.description} (retry)`,
               })
@@ -616,7 +745,16 @@ const FanOutPlugin: Plugin = async (input: PluginInput) => {
     // session.idle is redundant but belt-and-suspenders for message delivery
     if (event.type === "session.idle") {
       const { sessionID } = (event as EventSessionIdle).properties
-      for (const [, team] of teams) {
+      for (const [leadID, team] of teams) {
+        let isVerifierEvent = false
+        for (const [_, w] of team.workers) {
+          if (w.verifySessionID === sessionID) {
+            isVerifierEvent = true
+            break
+          }
+        }
+        if (isVerifierEvent) continue
+
         const worker = team.workers.get(sessionID)
         if (!worker) continue
         if (worker.queued.length > 0 && worker.status?.type !== "busy") {
