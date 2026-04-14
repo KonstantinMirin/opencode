@@ -49,13 +49,9 @@ export function SubagentFooter() {
       currency: "USD",
     })
 
-    const elapsed = last.time.completed ? last.time.completed - last.time.created : 0
-    const tps = elapsed > 0 ? last.tokens.output / (elapsed / 1000) : undefined
-
     return {
       context: pct ? `${Locale.number(tokens)} (${pct})` : Locale.number(tokens),
       cost: cost > 0 ? money.format(cost) : undefined,
-      tps: tps ? `${tps.toFixed(0)} t/s` : undefined,
     }
   })
 
@@ -91,7 +87,7 @@ export function SubagentFooter() {
             <Show when={usage()}>
               {(item) => (
                 <text fg={theme.textMuted} wrapMode="none">
-                  {[item().tps, item().context, item().cost].filter(Boolean).join(" · ")}
+                  {[item().context, item().cost].filter(Boolean).join(" · ")}
                 </text>
               )}
             </Show>
